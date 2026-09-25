@@ -4,7 +4,7 @@ import json
 import platform
 import sys
 
-import wit
+import dspy_bindings as wit
 
 
 @wit.guest

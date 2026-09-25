@@ -15,13 +15,13 @@ import traceback
 from typing import Any, Callable
 
 import dspy
-import wit
+import dspy_bindings as wit
 from dspy.clients import configure_cache
 from dspy.clients.cache import Cache
 from dspy.dsp.utils.settings import DEFAULT_CONFIG
 from dspy.lm15 import Message, Response, Usage
 from dspy.utils.dummies import DummyLM
-from wit.imports import host_lm
+from dspy_bindings.imports import host_lm
 
 
 def _json_default(value: Any) -> Any:
