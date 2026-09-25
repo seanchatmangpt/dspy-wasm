@@ -1,79 +1,107 @@
 # dspy-wasm
 
-DSPy behind a WebAssembly Component Model boundary.
+DSPy 3.4 packaged behind a WebAssembly Component Model boundary.
 
-The repository deliberately separates two subjects:
+The component runs DSPy program semantics inside Wasmtime. Provider/network
+actuation stays outside the component and is supplied through the typed
+`chatman:dspy/lm@0.1.0` WIT import.
 
-1. **Python -> WebAssembly Component** via Bytecode Alliance `componentize-py`.
-2. **DSPy dependency closure inside that component**.
-
-A DSPy-native dependency failure must not be interpreted as evidence that Python componentization failed.
-
-## Toolchain
-
-- Python `>=3.10,<3.15`
-- `componentize-py==0.25.0`
-- `wasmtime==48.0.0`
-- DSPy probe: `dspy==3.4.0`
-
-## Contract
-
-`wit/dspy.wit` is the source boundary:
+## Architecture
 
 ```text
-chatman:dspy/dspy
-  component-version() -> string
-  runtime-info()      -> string
-  dspy-version()      -> string
+DSPy program + adapters + signatures
+              |
+        componentize-py
+              |
+          dspy.wasm
+              |
+      WIT lm.complete(JSON)
+              |
+     Wasmtime host / ash_dspy
+              |
+      any authorized provider
 ```
 
-The string payloads are JSON-compatible where structured state is required. That keeps the first ABI intentionally small while the dependency boundary is being qualified.
+This keeps LiteLLM/OpenAI/provider SDKs out of the WASM dependency surface.
+DSPy 3.4's native custom-engine interface is the bridge.
 
-## First court: prove Python -> WASM
-
-```bash
-python -m pip install -e ".[dev]"
-make bootstrap
-make host-bootstrap
-```
-
-Expected meaning:
-
-```text
-bootstrap build + host execution => componentization path observed
-```
-
-This does **not** prove that DSPy itself can be packaged.
-
-## Second court: qualify DSPy
+## Build
 
 ```bash
 python -m pip install -e ".[dev,dspy]"
 make dspy
-make host-dspy
 ```
 
-`app.py` imports DSPy at module scope on purpose. Current `componentize-py` resolves application dependencies at build time, so the first incompatible dependency becomes an explicit boundary finding.
+`make dspy` installs a WASI overlay for `pydantic-core` and `regex` from
+the WASI wheels index before componentizing. DSPy's eager `orjson` usage is
+covered by `wasm_compat/orjson.py`, a deliberately narrow compatibility
+projection implementing only the API DSPy 3.4 uses on this path.
 
-DSPy 3.4.0 currently depends on packages including `regex`, `orjson`, `pydantic`, `litellm`, and `openai`. Native-extension or platform-specific failures should be classified by exact package rather than worked around implicitly.
-
-## State model
-
-- `bootstrap.wasm`: **UNKNOWN** until build and host execution are observed.
-- `dspy.wasm`: **UNKNOWN** until build and host execution are observed.
-- A failed DSPy build is a typed dependency finding; it does not change the bootstrap subject's state.
-- GitHub CI is evidence transport, not the definition of component liveness.
-
-## Next extension
-
-Once the import court identifies the exact incompatible dependency set:
+The generated artifact is:
 
 ```text
-dependency
-  -> existing WASI wheel?
-  -> pure-Python replacement?
-  -> capability moved across WIT boundary?
-  -> irreducible port
+dist/dspy.wasm
 ```
 
-The intended destination is not a Python RPC wrapper. It is a typed, language-neutral DSPy capability that Ash, SA2A, or another host can load through a WebAssembly component runtime.
+## WASM behavioral court
+
+The test is executed **inside the WebAssembly component**:
+
+```bash
+make wasm-test
+```
+
+`run-self-tests()` mirrors representative seams from DSPy's standard test
+suite:
+
+- `Example` input/label semantics
+- untyped and typed `Signature`
+- memory cache / stable cache keys
+- `DummyLM -> Predict`
+- `DummyLM -> ChainOfThought`
+- WIT host engine -> `Predict`
+
+A successful report has `"state": "ALIVE"` and every case `ALIVE`.
+
+## Host-backed Predict
+
+Deterministic host:
+
+```bash
+python host.py dist/dspy.wasm \
+  --predict-signature "question -> answer" \
+  --inputs '{"question":"What is the capital of France?"}' \
+  --response $'[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]'
+```
+
+OpenAI-compatible provider:
+
+```bash
+OPENAI_BASE_URL=https://api.openai.com/v1 \
+OPENAI_API_KEY=... \
+DSPY_WASM_MODEL=gpt-5-mini \
+python host.py dist/dspy.wasm \
+  --predict-signature "question -> answer" \
+  --inputs '{"question":"What is the capital of France?"}'
+```
+
+The WASM component never receives the API key. The host owns the irreversible
+provider call.
+
+## Bootstrap court
+
+The dependency-free Python -> Component Model court remains separate:
+
+```bash
+make bootstrap
+make host-bootstrap
+```
+
+A DSPy dependency failure therefore cannot be misclassified as a generic
+Python -> WASM failure.
+
+## Evidence
+
+Repository/CI execution establishes repository-local component behavior only.
+It does not by itself establish production deployment, provider authority, or
+external standing.

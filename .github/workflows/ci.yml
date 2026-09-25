@@ -17,8 +17,7 @@ jobs:
       - run: make bootstrap
       - run: make host-bootstrap
 
-  dspy-import-court:
-    continue-on-error: true
+  dspy-wasm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,5 +25,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[dev,dspy]"
+      - run: make test
       - run: make dspy
-      - run: make host-dspy
+      - run: python host.py dist/dspy.wasm --self-test
+      - name: Host-backed Predict
+        run: |
+          python host.py dist/dspy.wasm \
+            --predict-signature "question -> answer" \
+            --inputs '{"question":"What is the capital of France?"}' \
+            --response $'[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]'
