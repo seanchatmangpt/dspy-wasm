@@ -9,7 +9,7 @@ install-dspy:
 bindings:
 	rm -rf build/bindings
 	mkdir -p build/bindings
-	componentize-py -d wit -w dspy --bindings-module dspy_bindings \
+	componentize-py -d wit -w dspy --world-module dspy_bindings \
 		--import-interface-name chatman:dspy/lm@0.1.0=host_lm \
 		bindings build/bindings
 
@@ -29,7 +29,7 @@ wasi-deps:
 
 bootstrap:
 	mkdir -p dist
-	componentize-py -d wit -w bootstrap --bindings-module dspy_bindings componentize --stub-wasi -p . bootstrap -o dist/bootstrap.wasm
+	componentize-py -d wit -w bootstrap --world-module dspy_bindings componentize --stub-wasi -p . bootstrap -o dist/bootstrap.wasm
 
 dspy: wasi-deps
 	mkdir -p dist
