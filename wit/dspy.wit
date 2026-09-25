@@ -1,0 +1,12 @@
+package chatman:dspy@0.1.0;
+
+world dspy {
+    /// Version of the dspy-wasm component contract.
+    export component-version: func() -> string;
+
+    /// JSON runtime metadata. This is intentionally transport-neutral.
+    export runtime-info: func() -> string;
+
+    /// JSON envelope describing whether the DSPy Python package imported.
+    export dspy-version: func() -> string;
+}
