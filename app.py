@@ -177,8 +177,7 @@ def _self_test_report() -> dict[str, Any]:
     }
 
 
-@wit.guest
-class Dspy(wit.WorldExports):
+class DspyBindings(wit.DspyBindings):
     def component_version(self) -> str:
         return "0.1.0"
 
