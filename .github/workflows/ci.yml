@@ -57,6 +57,21 @@ jobs:
       - run: python wasi/build_wheels.py install
 
       - run: make dspy
+      - name: Pack consumer artifact
+        run: |
+          sha256sum dist/dspy.wasm > dist/dspy.wasm.sha256
+          cp wit/dspy.wit dist/dspy.wit
+          cp consumer/contract.json dist/contract.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dspy-wasm-${{ github.sha }}
+          path: |
+            dist/dspy.wasm
+            dist/dspy.wasm.sha256
+            dist/dspy.wit
+            dist/contract.json
+          if-no-files-found: error
+          retention-days: 30
       - run: python host.py dist/dspy.wasm --self-test
       - name: Host-backed Predict
         run: |
