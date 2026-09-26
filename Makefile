@@ -11,6 +11,7 @@ bindings:
 	mkdir -p build/bindings
 	componentize-py -d wit -w dspy --world-module dspy_bindings \
 		--import-interface-name chatman:dspy/lm@0.1.0=host_lm \
+		--import-interface-name chatman:dspy/tools@0.1.0=host_tools \
 		bindings build/bindings
 
 wasi-deps:
@@ -35,6 +36,7 @@ dspy: wasi-deps
 	mkdir -p dist
 	componentize-py -d wit -w dspy --world-module dspy_bindings \
 		--import-interface-name chatman:dspy/lm@0.1.0=host_lm \
+		--import-interface-name chatman:dspy/tools@0.1.0=host_tools \
 		componentize \
 		-p wasm_compat -p . -p build/wasi_deps \
 		app -o dist/dspy.wasm
@@ -49,7 +51,7 @@ wasm-test:
 	python host.py dist/dspy.wasm --self-test
 
 test:
-	pytest -q
+	python -m pytest -q
 
 clean:
 	rm -rf build dist

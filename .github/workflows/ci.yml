@@ -34,3 +34,17 @@ jobs:
             --predict-signature "question -> answer" \
             --inputs '{"question":"What is the capital of France?"}' \
             --response $'[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]'
+      - name: Capabilities
+        run: python host.py dist/dspy.wasm --capabilities
+      - name: Multi-hop retrieval pipeline
+        run: |
+          python host.py dist/dspy.wasm --run @examples/multihop_pipeline.json \
+            --responses @examples/multihop_responses.json
+      - name: CodeAct over host tools
+        run: |
+          python host.py dist/dspy.wasm --run @examples/code_act.json \
+            --responses @examples/code_act_responses.json
+      - name: Compile with BootstrapFewShot
+        run: |
+          python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
+            --responses @examples/compile_responses.json

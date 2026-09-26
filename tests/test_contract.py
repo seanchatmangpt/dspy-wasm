@@ -12,6 +12,10 @@ def test_contract_declares_bootstrap_and_operational_worlds() -> None:
     assert "import lm;" in text
     assert "export run-self-tests: func() -> string;" in text
     assert "export predict: func(signature: string, inputs-json: string) -> string;" in text
+    assert "import tools;" in text
+    assert "call: func(name: string, args-json: string) -> string;" in text
+    for export in ("capabilities", "run", "render", "evaluate", "compile"):
+        assert f"export {export}: func(" in text
 
 
 def test_component_implements_operational_exports() -> None:
@@ -22,6 +26,11 @@ def test_component_implements_operational_exports() -> None:
         "dspy_version",
         "run_self_tests",
         "predict",
+        "capabilities",
+        "run",
+        "render",
+        "evaluate",
+        "compile",
     ):
         assert f"def {method}" in app
 

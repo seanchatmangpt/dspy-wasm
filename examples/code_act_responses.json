@@ -1,0 +1,4 @@
+[
+  "[[ ## generated_code ## ]]\n```python\nprint(calculator('6 * 7'))\n```\n\n[[ ## finished ## ]]\nTrue\n\n[[ ## completed ## ]]",
+  "[[ ## reasoning ## ]]\nThe calculator printed 42.\n\n[[ ## answer ## ]]\n42\n\n[[ ## completed ## ]]"
+]
