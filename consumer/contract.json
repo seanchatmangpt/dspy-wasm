@@ -1,0 +1,30 @@
+{
+  "component": "dspy-wasm",
+  "component_version": "0.1.0",
+  "target": "wasm32-wasip2",
+  "wit_package": "chatman:dspy@0.1.0",
+  "world": "dspy",
+  "artifact": "dspy.wasm",
+  "payload_encoding": "json-string",
+  "success_state": "ALIVE",
+  "imports": {
+    "chatman:dspy/lm@0.1.0": [
+      "complete"
+    ],
+    "chatman:dspy/tools@0.1.0": [
+      "call"
+    ]
+  },
+  "exports": [
+    "component-version",
+    "runtime-info",
+    "dspy-version",
+    "run-self-tests",
+    "predict",
+    "capabilities",
+    "run",
+    "render",
+    "evaluate",
+    "compile"
+  ]
+}
