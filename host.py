@@ -24,12 +24,12 @@ import os
 import threading
 import urllib.request
 import weakref
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from wasmtime import Config, Engine, Store, Trap, WasiConfig, WasmtimeError
 from wasmtime.component import Component, Linker
-
 
 DEFAULT_RESPONSE = "[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]"
 
@@ -109,7 +109,7 @@ class CompletionProvider:
                     }
                 )
             return json.dumps(self._http_complete(request))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a callback must not trap the component
             return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
     def _http_complete(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -185,9 +185,13 @@ MAX_INT_BITS = 4096
 
 def _bounded(value: Any) -> Any:
     if isinstance(value, complex):
-        raise ValueError("result is not a real number")
+        # Every calculator refusal is a ValueError (one error contract).
+        raise ValueError("result is not a real number")  # noqa: TRY004
     if isinstance(value, int) and value.bit_length() > MAX_INT_BITS:
         raise ValueError("result too large")
+    # inf/nan have no JSON form: json.dumps would emit non-standard Infinity/NaN.
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("result is not finite")
     return value
 
 
@@ -317,8 +321,9 @@ class ToolProvider:
             args = json.loads(args_json)
             if not isinstance(args, dict):
                 raise TypeError("tool arguments must be a JSON object")
-            return json.dumps({"result": tool(**args)}, default=str)
-        except Exception as exc:
+            # allow_nan=False: a non-finite tool result is an error, never Infinity/NaN.
+            return json.dumps({"result": tool(**args)}, default=str, allow_nan=False)
+        except Exception as exc:  # noqa: BLE001 - a callback must not trap the component
             return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
 

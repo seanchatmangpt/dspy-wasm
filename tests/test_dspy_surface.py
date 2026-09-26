@@ -8,8 +8,8 @@ import pytest
 
 pytest.importorskip("dspy")
 
-import dspy_capabilities as caps  # noqa: E402
-from dspy_doubles import chat, schema_echo, scripted  # noqa: E402
+import dspy_capabilities as caps
+from dspy_doubles import chat, schema_echo, scripted
 
 PASSAGES = {
     "who wrote hamlet": ["Hamlet was written by William Shakespeare."],

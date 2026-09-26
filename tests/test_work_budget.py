@@ -19,9 +19,9 @@ import pytest
 
 pytest.importorskip("dspy")
 
-import dspy_capabilities as caps  # noqa: E402
-import host  # noqa: E402
-from dspy_doubles import chat, scripted  # noqa: E402
+import dspy_capabilities as caps
+import host
+from dspy_doubles import chat, scripted
 
 TOOLS = host.ToolProvider()
 

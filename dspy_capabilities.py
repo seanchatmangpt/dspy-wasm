@@ -10,7 +10,7 @@ and run any upstream DSPy program without Python-level access:
       "adapter": "chat" | "json" | "xml" | "two-step",
       "lm": {"model": "...", "temperature": 0.0, "max_tokens": 512, "cache": false, ...},
       "demos": [{...}],                 # few-shot demos for every predictor
-      "program_state": {...},           # `compile` output, loaded verbatim
+      "program_state": {...},           # `compile` output (bound by __subject__)
       "tools": [{"name", "description", "parameters"}],   # react/react-v2/code-act/rlm
       ...module-specific keys, see build_module()
     }
@@ -40,7 +40,8 @@ import json
 import keyword
 import linecache
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import dspy
 import pydantic
@@ -161,6 +162,16 @@ def _repeat_times(step: dict[str, Any]) -> int:
     return times
 
 
+def _body_work(steps: Any) -> int:
+    """Work of one repeat/foreach iteration: its body, and at least 1.
+
+    An iteration over an empty body executes no step but still loops; without
+    the floor, ``foreach`` over a long state list around ``repeat: 10000``
+    with ``steps: []`` would iterate ~1e9 times while charging only 1e5.
+    """
+    return max(1, pipeline_work(steps))
+
+
 def pipeline_work(steps: Any) -> int:
     """Worst-case executed-step count of a pipeline step list.
 
@@ -181,11 +192,11 @@ def pipeline_work(steps: Any) -> int:
         work = 1
         if "repeat" in step:
             times = _repeat_times(step)
-            work += times * pipeline_work(step.get("steps") or [])
+            work += times * _body_work(step.get("steps") or [])
         elif "foreach" in step:
             items = step["foreach"]
             multiplier = len(items) if isinstance(items, list) else 1
-            work += multiplier * pipeline_work(step.get("steps") or [])
+            work += multiplier * _body_work(step.get("steps") or [])
         elif "program" in step:
             program = step["program"]
             if isinstance(program, dict) and program.get("module") == "pipeline":
@@ -379,7 +390,7 @@ class HostTools:
         lines = source.splitlines(keepends=True)
         linecache.cache[filename] = (len(source), None, lines, filename)
         namespace: dict[str, Any] = {"__host_tool__": self.call}
-        exec(compile(source, filename, "exec"), namespace)
+        exec(compile(source, filename, "exec"), namespace)  # noqa: S102 - generated shim source
         return namespace[name]
 
     def tool(self, spec: dict[str, Any]) -> dspy.Tool:
@@ -758,14 +769,20 @@ class Pipeline(dspy.Module):
                 for key, expr in step["set"].items():
                     self._store(state, key, self._resolve(expr, state), key in accumulate)
             elif "repeat" in step:
+                empty = not step.get("steps")
                 for _ in range(_repeat_times(step)):
+                    if empty:  # the loop itself is the work (see _body_work)
+                        budget.charge()
                     self._execute(step["steps"], state)
                     if "until" in step and self._resolve(step["until"], state):
                         break
             elif "foreach" in step:
                 collect = step.get("collect") or {}
                 gathered: dict[str, list] = {key: [] for key in collect}
+                empty = not step.get("steps")
                 for item in self._resolve(step["foreach"], state):
+                    if empty:  # the loop itself is the work (see _body_work)
+                        budget.charge()
                     inner = {**state, step.get("as", "item"): item}
                     self._execute(step["steps"], inner)
                     for key, inner_key in collect.items():
@@ -818,13 +835,23 @@ def admit_program_state(module: dspy.Module, state: Any) -> dict[str, Any]:
     DSPy's own ``Signature.load_state`` zips saved fields onto the current
     signature non-strictly, so a state compiled for a different signature
     would otherwise load silently with its prefixes and demos misapplied.
+
+    The subject is mandatory: a state without one would bypass the binding,
+    so a stale state could be stripped of its subject and loaded into any
+    program with the same field counts. The digest is an unkeyed hash of
+    public structure; it detects a state meant for another program, not a
+    deliberately forged one (the host, not the request, owns authenticity).
     """
     if not isinstance(state, dict):
         raise RequestError("program_state must be a JSON object")
     body = {key: value for key, value in state.items() if key != SUBJECT_KEY}
     expected = program_subject(module)
     subject = state.get(SUBJECT_KEY)
-    if subject is not None and subject != expected:
+    if subject is None:
+        raise RequestError(
+            f"unbound program_state: no {SUBJECT_KEY!r}; produce it with compile"
+        )
+    if subject != expected:
         raise RequestError(f"stale program_state: compiled for {subject}, program is {expected}")
     for name, predictor in module.named_predictors():
         entry = body if name == "self" else body.get(name)
@@ -863,7 +890,8 @@ class Builder:
             demos = [dspy.Example(**demo) for demo in spec["demos"]]
             for predictor in module.predictors():
                 predictor.demos = list(demos)
-        if spec.get("program_state"):
+        # Presence, not truthiness: [], 0, false and "" are refused, not ignored.
+        if spec.get("program_state") is not None:
             module.load_state(admit_program_state(module, spec["program_state"]))
         return module
 
@@ -1294,7 +1322,7 @@ def describe() -> dict[str, Any]:
 def guarded(capability: Callable[[], dict[str, Any]]) -> str:
     try:
         return dumps(capability())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - every failure crosses the boundary as FAILED
         return dumps({"state": "FAILED", "error_type": type(exc).__name__, "message": str(exc)})
 
 

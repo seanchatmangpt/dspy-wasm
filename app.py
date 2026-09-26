@@ -19,19 +19,22 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 # Import numpy completely before dspy: dspy.utils.lazy_import parks a lazy
 # proxy in sys.modules["numpy"], and numpy's own initialisation re-enters it.
-import numpy  # noqa: E402
-import numpy.fft  # noqa: E402,F401
-import numpy.linalg  # noqa: E402,F401
-import numpy.ma  # noqa: E402,F401
-import numpy.random  # noqa: E402,F401
+import numpy
+import numpy.fft
+import numpy.linalg
+import numpy.ma
+import numpy.random
 
-import copy  # noqa: E402
+# isort: split
+
+import copy
 import json
 import linecache
 import platform
 import sys
 import traceback
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import dspy
 import dspy_bindings as wit
@@ -46,24 +49,27 @@ from dspy_doubles import chat as _chat
 from dspy_doubles import schema_echo
 from dspy_doubles import scripted as _scripted
 
+# isort: split
+
 # componentize-py snapshots the interpreter after module import, and the host
 # grants no filesystem. Anything DSPy would import lazily on a call path must
 # therefore be imported here, at build time.
-import cachetools  # noqa: E402,F401
-import cachetools.keys  # noqa: E402,F401
-import dspy.clients.call_result  # noqa: E402,F401
-import dspy.clients.costs  # noqa: E402,F401
-import dspy.clients.engines.dummy_engine  # noqa: E402,F401
-import dspy.clients.engines.streaming  # noqa: E402,F401
-import dspy.clients.execution  # noqa: E402,F401
-import dspy.utils.hasher  # noqa: E402,F401
-import gepa.lm  # noqa: E402,F401
-import hashlib  # noqa: E402,F401
-import litellm  # noqa: E402
-import litellm.rust_bridge._native  # noqa: E402,F401
-import optuna  # noqa: E402
-import optuna.samplers  # noqa: E402,F401
-import ssl  # noqa: E402,F401
+import hashlib
+import ssl
+
+import cachetools
+import cachetools.keys  # noqa: F401
+import dspy.clients.call_result
+import dspy.clients.costs
+import dspy.clients.engines.dummy_engine
+import dspy.clients.engines.streaming
+import dspy.clients.execution
+import dspy.utils.hasher
+import gepa.lm  # noqa: F401
+import litellm
+import litellm.rust_bridge._native
+import optuna
+import optuna.samplers
 
 
 def _materialize_litellm() -> None:
@@ -73,14 +79,14 @@ def _materialize_litellm() -> None:
     for name in list(_lazy_imports._get_lazy_import_registry()):
         try:
             getattr(litellm, name)
-        except Exception:  # an optional provider's extra dependency
+        except Exception:  # noqa: BLE001, S110 - an optional provider's extra dependency
             pass
 
 
 _materialize_litellm()
 
 try:  # tqdm's write lock probes multiprocessing; absent under WASI is fine.
-    import multiprocessing.synchronize  # noqa: E402,F401
+    import multiprocessing.synchronize  # noqa: F401
 except ImportError:
     pass
 
@@ -297,6 +303,34 @@ def _case_compile_round_trip() -> None:
         _chat(answer="Rome"),
     )
     assert report["outputs"]["answer"] == "Rome"
+
+
+
+def _case_boundary_refusals() -> None:
+    """The request-boundary guards hold inside the component too."""
+
+    def refusal(request: dict[str, Any]) -> str:
+        _reset()
+        report = json.loads(
+            caps.guarded(lambda: caps.run(request, _scripted("unused"), host_tools.call))
+        )
+        assert report["state"] == "FAILED", report
+        return report["message"]
+
+    nested: list[dict[str, Any]] = [{"set": {"x": 1}}]
+    for _ in range(3):
+        nested = [{"repeat": caps.MAX_REPEAT, "steps": nested}]
+    message = refusal({"module": "pipeline", "steps": nested, "inputs": {}})
+    assert f"MAX_TOTAL_STEPS={caps.MAX_TOTAL_STEPS}" in message
+    empty_loops = [{"foreach": "$items", "steps": [{"repeat": caps.MAX_REPEAT, "steps": []}]}]
+    message = refusal({"module": "pipeline", "steps": empty_loops, "inputs": {"items": [0] * 100}})
+    assert f"MAX_TOTAL_STEPS={caps.MAX_TOTAL_STEPS}" in message
+    for falsy in ([], 0, False, ""):
+        message = refusal({"program_state": falsy, "inputs": {"question": "q"}})
+        assert "program_state must be a JSON object" in message
+    unbound = {"signature": {"fields": [{}, {}]}}
+    message = refusal({"program_state": unbound, "inputs": {"question": "q"}})
+    assert "unbound program_state" in message
 
 
 CALCULATOR = {
@@ -547,6 +581,7 @@ CASES: tuple[tuple[str, Callable[[], None]], ...] = (
     ("render", _case_render),
     ("evaluate", _case_evaluate),
     ("compile-round-trip", _case_compile_round_trip),
+    ("boundary-refusals", _case_boundary_refusals),
     ("multihop-pipeline", _case_multihop_pipeline),
     ("program-of-thought", _case_program_of_thought),
     ("code-act-host-tool", _case_code_act_host_tool),
@@ -585,7 +620,7 @@ def _self_test_report() -> dict[str, Any]:
         try:
             case()
             results.append({"name": name, "state": "ALIVE"})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reported as BUILD_BROKEN, never raised into the host
             results.append(
                 {
                     "name": name,
@@ -656,7 +691,7 @@ class DspyBindings(wit.DspyBindings):
                 default=caps.json_default,
                 sort_keys=True,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reported as BUILD_BROKEN, never raised into the host
             return json.dumps(
                 {
                     "state": "BUILD_BROKEN",

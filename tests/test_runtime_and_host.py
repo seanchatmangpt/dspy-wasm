@@ -9,10 +9,11 @@ import pytest
 
 pytest.importorskip("dspy")
 
-import dspy  # noqa: E402
-import dspy_runtime as rt  # noqa: E402
-import host  # noqa: E402
-from dspy.primitives.code_interpreter import CodeExecutionError, FinalOutput  # noqa: E402
+import dspy
+from dspy.primitives.code_interpreter import CodeExecutionError, FinalOutput
+
+import dspy_runtime as rt
+import host
 
 
 def test_component_interpreter_matches_local_interpreter_outcomes() -> None:

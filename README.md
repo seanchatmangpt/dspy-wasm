@@ -46,6 +46,13 @@ Requirements: a Rust toolchain with the `wasm32-wasip2` target (rustc >= 1.95),
 `uv`, and a C toolchain for the native CPython bootstrap. Everything else is
 downloaded and built by `wasi/toolchain.sh`.
 
+Build hosts: Linux or macOS, on x86_64 or arm64. `wasi/toolchain.sh` picks
+the matching wasi-sdk release (`wasi-sdk-33.0-{x86_64,arm64}-{linux,macos}`),
+verifies its published sha256 (`sha256sum`, or `shasum -a 256` on macOS) and
+refuses any other host with exit code 2. `JOBS` defaults to `nproc`, or
+`sysctl -n hw.ncpu` where `nproc` is absent. CI builds on `ubuntu-latest`
+(x86_64 Linux).
+
 ### Every dependency is real WebAssembly
 
 The component runs CPython 3.14 via componentize-py 0.25.1. The full locked
@@ -244,8 +251,9 @@ few-shot with a host embedder, the in-component embeddings retriever, the
 BootstrapRS, COPRO, MIPROv2, SIMBA, GEPA, InferRules and BootstrapOptuna
 optimizers, and the compiled dependencies themselves: every native extension
 loaded from its `.so`, numpy linear algebra and FFT, optuna's TPE sampler,
-OpenSSL TLS contexts and hashing, and litellm with its Rust bridge (35
-cases).
+OpenSSL TLS contexts and hashing, and litellm with its Rust bridge, plus the
+request-boundary refusals (nested-repeat budget, `program_state` admission)
+executed inside the component (36 cases).
 
 A successful report has `"state": "ALIVE"` and every case `ALIVE`. The same
 capability code is exercised natively by `make test`.
@@ -293,25 +301,37 @@ Python -> WASM failure.
 
 - `compile` binds `program_state` to its program under `__subject__` (a
   digest of predictor names and signature fields); `run`/`compile` refuse a
-  stale or tampered state, and a state whose field count does not match.
+  state without a subject, a stale or tampered subject, and a body whose field
+  count does not match. `program_state` must be an object when present
+  (`null` means absent). The digest is unkeyed: it catches a state meant for
+  another program, not a deliberately forged one.
 - Pipeline step names cannot shadow pipeline attributes (`forward`,
   `outputs`, ...), two different programs cannot share one normalised name,
   and `repeat` is an integer in `[0, 10000]`; `tests/test_work_budget.py`
-  bounds the whole pipeline's work (nested multipliers) by `MAX_TOTAL_STEPS`.
+  bounds the whole pipeline's work (nested multipliers) by `MAX_TOTAL_STEPS`,
+  and an iteration over an empty body is still charged one step.
 - `tests/test_host_deadline.py`: spinning core and component exports are
   interrupted at the epoch deadline; the deadline is re-armed per call.
 - A tool envelope must carry `result` or `error`; generated tool shims refuse
   names that would shadow `__host_tool__`/`SUBMIT`.
 - `SUBMIT` cannot be swallowed by `except` in interpreted code.
-- Host tools: `calculator` refuses results above 4096 bits and non-real
-  values; `search` needs `k >= 0`; `embed` needs an array of strings.
+- Host tools: `calculator` refuses results above 4096 bits (powers are
+  refused before they are computed), non-real and non-finite values; every
+  tool envelope is strict JSON (no `Infinity`/`NaN`); `search` needs
+  `k >= 0`; `embed` needs an array of strings.
 
 ```bash
 make bench   # writes bench/receipt.json; medians bounded by BOUNDS_MS
 ```
 
 `tests/test_bench_bounds.py` reruns every case and fails when a median
-exceeds its ceiling.
+exceeds its ceiling, and refuses a ceiling more than 10x its committed
+median. When `dist/dspy.wasm` is present the benchmark also times DSPy
+executing inside the component (`wasm:dspy-run-predict`,
+`wasm:dspy-compile-labeled-few-shot`: `run`/`compile` exports on one
+instance); `bootstrap.wasm` alone contains no DSPy. Instantiation is
+reported under `setup_ms`, unbounded: it measures wasmtime's compilation
+cache (hit or miss) more than the component.
 
 ## Evidence
 

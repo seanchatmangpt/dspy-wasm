@@ -30,5 +30,10 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# Imports after pytest.importorskip are deliberate and marked `noqa: E402`;
+# keep E402 selected so those marks stay checked whatever ruff's default set is.
+extend-select = ["E402"]
+
 [tool.setuptools]
 py-modules = []

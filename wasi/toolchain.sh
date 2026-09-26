@@ -11,16 +11,52 @@ OUT="${WASI_BUILD_DIR:-$ROOT/build/wasi}"
 WASI_SDK_VERSION="${WASI_SDK_VERSION:-33}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.0}"
 ZLIB_VERSION="${ZLIB_VERSION:-1.3.1}"
-JOBS="${JOBS:-$(nproc)}"
+
+# wasi-sdk publishes host builds for {x86_64,arm64}-{linux,macos}; pick ours.
+case "$(uname -s)" in
+  Linux) SDK_OS=linux ;;
+  Darwin) SDK_OS=macos ;;
+  *) echo "unsupported build host OS: $(uname -s) (need Linux or macOS)" >&2; exit 2 ;;
+esac
+case "$(uname -m)" in
+  x86_64 | amd64) SDK_ARCH=x86_64 ;;
+  arm64 | aarch64) SDK_ARCH=arm64 ;;
+  *) echo "unsupported build host arch: $(uname -m) (need x86_64 or arm64)" >&2; exit 2 ;;
+esac
+host_jobs() {
+  if command -v nproc >/dev/null 2>&1; then nproc
+  elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu
+  else echo 4
+  fi
+}
+JOBS="${JOBS:-$(host_jobs)}"
 
 mkdir -p "$OUT"
 cd "$OUT"
+
+# sha256sum (GNU coreutils) is absent on macOS, where shasum ships instead.
+sha256_check() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum -c --quiet -
+  else shasum -a 256 -c --quiet -
+  fi
+}
+
+# Published digests of the wasi-sdk host builds (GitHub release asset digests).
+wasi_sdk_sha256() {
+  case "${WASI_SDK_VERSION}:$1" in
+    33:x86_64-linux) echo 0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce ;;
+    33:arm64-linux) echo 4f98ee738c7abb45c81a94d1461fc53cc569d1cd01498951c8184d841a027844 ;;
+    33:x86_64-macos) echo 18f3f201ba9734e6a4455b0b6410690395a55e9ffa9f6f5066f66083a94b93b3 ;;
+    33:arm64-macos) echo 85c997a2665ead91673b5bb88b7d0df3fc8900df3bfa244f720d478187bbdc78 ;;
+    *) echo "no pinned wasi-sdk digest for ${WASI_SDK_VERSION}:$1" >&2; exit 2 ;;
+  esac
+}
 
 # fetch URL DEST SHA256: download with retries and verify the pinned digest,
 # so an error page from a mirror fails here rather than as a tar error later.
 fetch() {
   curl -sSfL --retry 5 --retry-all-errors -o "$2" "$1"
-  if ! echo "$3  $2" | sha256sum -c --quiet -; then
+  if ! echo "$3  $2" | sha256_check; then
     echo "sha256 mismatch for $1" >&2
     rm -f "$2"
     exit 1
@@ -30,8 +66,8 @@ fetch() {
 # --- wasi-sdk -----------------------------------------------------------------
 SDK="$OUT/wasi-sdk"
 if [ ! -x "$SDK/bin/clang" ]; then
-  fetch "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz" \
-    wasi-sdk.tar.gz 0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce
+  fetch "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-${SDK_ARCH}-${SDK_OS}.tar.gz" \
+    wasi-sdk.tar.gz "$(wasi_sdk_sha256 "${SDK_ARCH}-${SDK_OS}")"
   rm -rf "$SDK" && mkdir -p "$SDK"
   tar -xzf wasi-sdk.tar.gz -C "$SDK" --strip-components=1
   rm wasi-sdk.tar.gz
@@ -43,7 +79,9 @@ fi
 HOST_PY="$OUT/host-python"
 export UV_PYTHON_INSTALL_DIR="$OUT/uv-python"
 if [ ! -x "$HOST_PY/bin/python" ]; then
-  uv venv --clear --seed --managed-python --python "$PYTHON_VERSION" "$HOST_PY"
+  # --python-preference, not --managed-python: the latter is refused when
+  # UV_PYTHON_PREFERENCE is set in the environment (clap arg conflict).
+  uv venv --clear --seed --python-preference only-managed --python "$PYTHON_VERSION" "$HOST_PY"
 fi
 
 # --- CPython source -----------------------------------------------------------
@@ -57,11 +95,19 @@ if [ ! -f "$SRC/configure" ]; then
 fi
 
 # Native build python (configure requires an exact-version build interpreter).
+# On macOS (case-insensitive filesystems) CPython names the binary python.exe.
 NATIVE="$SRC/builddir/build"
-if [ ! -x "$NATIVE/python" ]; then
+native_python() {
+  for candidate in "$NATIVE/python" "$NATIVE/python.exe"; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then echo "$candidate"; return 0; fi
+  done
+  return 1
+}
+if ! native_python >/dev/null; then
   mkdir -p "$NATIVE"
   (cd "$NATIVE" && ../../configure --prefix="$NATIVE/install" >/dev/null && make -j"$JOBS" >/dev/null)
 fi
+NATIVE_PY="$(native_python)"
 
 WASI="$SRC/builddir/wasi"
 DEPS="$WASI/deps"
@@ -72,8 +118,10 @@ if [ ! -f "$DEPS/lib/libz.a" ]; then
   fetch "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz" \
     zlib.tar.gz 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
   rm -rf zlib && mkdir zlib && tar -xzf zlib.tar.gz -C zlib --strip-components=1 && rm zlib.tar.gz
-  (cd zlib && CC="$SDK/bin/clang --target=wasm32-wasip2" CFLAGS="-fPIC -O2" AR="$SDK/bin/llvm-ar" \
-     RANLIB="$SDK/bin/llvm-ranlib" ./configure --static --prefix="$DEPS" >/dev/null && make -j"$JOBS" install >/dev/null)
+  # CHOST keeps zlib's configure from probing the build host (on macOS it
+  # would pick Apple libtool, which cannot archive wasm objects).
+  (cd zlib && CHOST=wasm32-wasip2 CC="$SDK/bin/clang --target=wasm32-wasip2" CFLAGS="-fPIC -O2" \
+     AR="$SDK/bin/llvm-ar" ARFLAGS=rc RANLIB="$SDK/bin/llvm-ranlib" ./configure --static --prefix="$DEPS" >/dev/null && make -j"$JOBS" install >/dev/null)
 fi
 
 # --- libyaml for wasm32-wasip2 (PIC), linked statically into PyYAML's _yaml ----
@@ -140,7 +188,7 @@ if [ ! -f "$WASI/libpython3.14.a" ]; then
     ../../Tools/wasm/wasi-env ../../configure -C \
       --host=wasm32-unknown-wasip2 \
       --build="$(../../config.guess)" \
-      --with-build-python="$NATIVE/python" \
+      --with-build-python="$NATIVE_PY" \
       --prefix="$WASI/install" \
       --disable-test-modules \
       --enable-ipv6 >/dev/null
@@ -191,6 +239,9 @@ PY
   # repo, `componentize-py -p .` would discover their WIT worlds.
   rm -rf componentize-py-src
 fi
+# Also drop a crate source left by an older toolchain run: its test SDK
+# worlds make `componentize` refuse ("There are multiple main packages").
+rm -rf "$OUT/componentize-py-src"
 
 SYSCONFIG_DIR="$(cat "$WASI/pybuilddir.txt")"
 

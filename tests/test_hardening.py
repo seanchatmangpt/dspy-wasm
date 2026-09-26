@@ -9,17 +9,20 @@ the component runs, and the deterministic LM doubles in dspy_doubles.
 from __future__ import annotations
 
 import json
+import threading
 import time
+import tracemalloc
 
 import pytest
 
 pytest.importorskip("dspy")
 
-import dspy_capabilities as caps  # noqa: E402
-import dspy_runtime as rt  # noqa: E402
-import host  # noqa: E402
-from dspy.primitives.code_interpreter import FinalOutput  # noqa: E402
-from dspy_doubles import chat, scripted  # noqa: E402
+from dspy.primitives.code_interpreter import FinalOutput
+
+import dspy_capabilities as caps
+import dspy_runtime as rt
+import host
+from dspy_doubles import chat, scripted
 
 TOOLS = host.ToolProvider()
 
@@ -91,6 +94,91 @@ def test_pipeline_repeat_is_bounded_and_typed(times) -> None:
         scripted("unused"),
     )
     refused(report, "'repeat' must be an integer")
+
+
+def _nested_repeat(levels: int, body: list[dict]) -> list[dict]:
+    steps = body
+    for _ in range(levels):
+        steps = [{"repeat": caps.MAX_REPEAT, "steps": steps}]
+    return steps
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        _nested_repeat(3, [{"set": {"x": 1}}]),  # 1e12 iterations before the budget
+        _nested_repeat(3, []),  # empty bodies still iterate: each iteration is charged
+        # Statically 1 + (1 + 10000): admitted; at run time 100 items x 10000
+        # empty iterations. Before the empty-body charge it ran 1e6 uncharged
+        # loops (1e9 with a 1e5-item list) and returned ALIVE.
+        [{"foreach": "$items", "steps": _nested_repeat(1, [])}],
+    ],
+    ids=["nested-set", "nested-empty", "foreach-x-repeat"],
+)
+def test_nested_iteration_is_bounded_in_total_work(steps) -> None:
+    # Before: MAX_REPEAT held per level only; 3 nested repeats ran ~18 days.
+    # (tests/test_work_budget.py pins the budget itself; these add empty bodies.)
+    # A daemon thread makes a regression fail this test instead of hanging it.
+    request = {"module": "pipeline", "steps": steps, "inputs": {"items": list(range(100))}}
+    reports: list[dict] = []
+    worker = threading.Thread(
+        target=lambda: reports.append(guarded(caps.run, request, scripted("unused"))),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(10.0)
+    assert not worker.is_alive(), "nested iteration was not bounded in total work"
+    refused(reports[0], f"MAX_TOTAL_STEPS={caps.MAX_TOTAL_STEPS}")
+
+
+def test_empty_body_iterations_are_counted_statically() -> None:
+    work = caps.pipeline_work
+    assert work([{"repeat": 10, "steps": []}]) == 1 + 10
+    assert work([{"foreach": [1, 2, 3], "steps": []}]) == 1 + 3
+    # Nested empty repeats are refused before any step runs: a real host tool
+    # placed first records whether execution started.
+    marks: list[int] = []
+    tools = host.ToolProvider({"mark": lambda: marks.append(1) or len(marks)})
+    request = {
+        "module": "pipeline",
+        "steps": [{"tool": "mark", "args": {}}, *_nested_repeat(2, [])],
+        "inputs": {},
+    }
+    report = json.loads(
+        caps.guarded(
+            lambda: caps.run(
+                request, scripted("unused"), lambda n, a: tools.call(None, n, a)
+            )
+        )
+    )
+    refused(report, f"MAX_TOTAL_STEPS={caps.MAX_TOTAL_STEPS}")
+    assert marks == []
+
+
+def test_foreach_with_an_empty_body_is_charged_per_item() -> None:
+    steps = [{"foreach": "$items", "steps": []}]
+    ok = guarded(caps.run, {"module": "pipeline", "steps": steps, "inputs": {"items": [1, 2]}},
+                 scripted("unused"))
+    assert ok["state"] == "ALIVE", ok
+    items = list(range(caps.MAX_TOTAL_STEPS))
+    report = guarded(
+        caps.run, {"module": "pipeline", "steps": steps, "inputs": {"items": items}},
+        scripted("unused"),
+    )
+    refused(report, f"MAX_TOTAL_STEPS={caps.MAX_TOTAL_STEPS}")
+
+
+def test_single_level_repeat_at_its_bound_still_runs() -> None:
+    report = guarded(
+        caps.run,
+        {
+            "module": "pipeline",
+            "steps": [{"repeat": caps.MAX_REPEAT, "steps": [{"set": {"x": "$$done"}}]}],
+            "inputs": {},
+        },
+        scripted("unused"),
+    )
+    assert report["state"] == "ALIVE" and report["outputs"] == {"x": "$done"}
 
 
 # ------------------------------------------------------------ tool envelopes
@@ -178,25 +266,41 @@ def test_tampered_subject_digest_is_refused() -> None:
     refused(report, "stale program_state")
 
 
-def test_unbound_state_with_wrong_field_count_is_refused() -> None:
+def test_stripped_subject_cannot_smuggle_a_stale_state() -> None:
+    # Before: popping __subject__ made the state 'unbound' and it loaded
+    # silently into any signature with the same field count.
     state = {k: v for k, v in _compiled().items() if k != caps.SUBJECT_KEY}
     report = guarded(
         caps.run,
-        {
-            "signature": "context, question -> summary",
-            "program_state": state,
-            "inputs": {"context": "c", "question": "q"},
-        },
-        scripted(chat(summary="s")),
+        {"signature": "context -> summary", "program_state": state, "inputs": {"context": "c"}},
+        scripted(chat(summary="S")),
     )
-    refused(report, "fields; signature has 3")
+    refused(report, "unbound program_state")
 
 
-def test_program_state_must_be_an_object() -> None:
+def test_state_body_inconsistent_with_its_subject_is_refused() -> None:
+    state = _compiled()
+    state["signature"] = {**state["signature"], "fields": state["signature"]["fields"][:1]}
     report = guarded(
-        caps.run, {"program_state": [1], "inputs": {"question": "q"}}, scripted(chat(answer="x"))
+        caps.run, {"program_state": state, "inputs": {"question": "q"}}, scripted(chat(answer="x"))
+    )
+    refused(report, "fields; signature has 2")
+
+
+@pytest.mark.parametrize("state", [[1], [], 0, False, ""])
+def test_program_state_must_be_an_object(state) -> None:
+    # Before: falsy values ([], 0, false, "") skipped admission and were ignored.
+    report = guarded(
+        caps.run, {"program_state": state, "inputs": {"question": "q"}}, scripted(chat(answer="x"))
     )
     refused(report, "program_state must be a JSON object")
+
+
+def test_null_program_state_means_absent() -> None:
+    report = guarded(
+        caps.run, {"program_state": None, "inputs": {"question": "q"}}, scripted(chat(answer="x"))
+    )
+    assert report["state"] == "ALIVE" and report["outputs"] == {"answer": "x"}
 
 
 def test_ensemble_refuses_a_stale_member() -> None:
@@ -308,10 +412,52 @@ def test_calculator_refuses_doubly_exponential_growth_quickly() -> None:
     assert host.calculator("2 ** 10 - (3 * 4) / 2") == 1018
 
 
+def _peak_bytes(expression: str) -> int:
+    tracemalloc.start()
+    try:
+        try:
+            host.calculator(expression)
+        except ValueError:
+            pass
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_power_is_refused_before_it_is_computed() -> None:
+    # (2**64)**63 has 4033 bits; raising it to 64 would allocate ~32 KiB
+    # before any post-check could refuse it. The pre-check refuses first.
+    _peak_bytes("1 + 1")  # warm caches so both measurements see the same overhead
+    allowed = _peak_bytes("(2**64)**63")
+    with pytest.raises(ValueError, match="too large"):
+        host.calculator("((2**64)**63)**64")
+    refused_peak = _peak_bytes("((2**64)**63)**64")
+    assert refused_peak - allowed < 8 * 1024, (refused_peak, allowed)
+
+
 @pytest.mark.parametrize("expression", ["(-1) ** 0.5", "True + 1", "1j"])
 def test_calculator_is_real_arithmetic_only(expression: str) -> None:
     with pytest.raises(ValueError):
         host.calculator(expression)
+
+
+@pytest.mark.parametrize("expression", ["1e308 * 1e308", "-1e308 * 10", "1e308 * 10 - 1e308 * 10"])
+def test_calculator_refuses_non_finite_results(expression: str) -> None:
+    # Before: '1e308*1e308' returned inf, serialised as non-standard 'Infinity'.
+    with pytest.raises(ValueError, match="not finite"):
+        host.calculator(expression)
+    raw = TOOLS.call(None, "calculator", json.dumps({"expression": expression}))
+
+    def strict(token: str):
+        raise AssertionError(f"non-standard JSON constant {token}")
+
+    assert "not finite" in json.loads(raw, parse_constant=strict)["error"]
+
+
+def test_tool_envelope_is_strict_json_for_any_tool() -> None:
+    provider = host.ToolProvider({"nan": lambda: float("nan")})
+    envelope = json.loads(provider.call(None, "nan", "{}"))
+    assert "Out of range float values" in envelope["error"]
 
 
 def test_search_k_bounds() -> None:
@@ -341,5 +487,9 @@ def test_submit_cannot_be_swallowed_by_interpreted_code() -> None:
     assert interpreter.execute(swallowed) == FinalOutput({"answer": 1})
     bare = "try:\n    SUBMIT(answer=2)\nexcept:\n    pass\n'escaped'"
     assert interpreter.execute(bare) == FinalOutput({"answer": 2})
+    # SUBMIT ends execution even under 'except Exception': nothing after it runs.
+    stops = "try:\n    SUBMIT(answer=3)\nexcept Exception:\n    pass\nran_past_submit = True"
+    assert interpreter.execute(stops) == FinalOutput({"answer": 3})
+    assert interpreter.execute("globals().get('ran_past_submit', False)") is False
     # A later execution without SUBMIT is unaffected by the earlier one.
     assert interpreter.execute("'next'") == "next"

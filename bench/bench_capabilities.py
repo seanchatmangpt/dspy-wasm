@@ -2,42 +2,59 @@
 
 Measures the exact code the component runs (dspy_capabilities over the JSON
 lm/tool boundary, with the real host ToolProvider and deterministic LM
-doubles), the host tools, and, when ``dist/bootstrap.wasm`` exists, a real
-Wasmtime instantiate + export call of the bootstrap component.
+doubles), the host tools, and, for each component present under ``dist/``,
+real Wasmtime calls: ``bootstrap.wasm`` (instantiate + export call, no DSPy)
+and ``dspy.wasm`` (instantiate, and DSPy ``run``/``compile`` executing
+inside the component over the host lm/tools imports).
 
     python bench/bench_capabilities.py                 # print the report
     python bench/bench_capabilities.py --write bench/receipt.json
 
 ``BOUNDS_MS`` are the regression ceilings (median, milliseconds) enforced by
-tests/test_bench_bounds.py; they sit well above the recorded medians so that
-only an order-of-magnitude regression (or an unbounded path) trips them.
+tests/test_bench_bounds.py. Each is about 6-8x the committed median: room for
+a slower CI runner, but a 10x regression on the recording machine trips it.
+``tests/test_bench_bounds.py`` also refuses a ceiling more than
+``MAX_HEADROOM`` times its committed median, so bounds cannot drift loose.
+
+Component instantiation is reported under ``setup_ms`` and is not bounded:
+it is dominated by wasmtime's on-disk compilation cache (a hit loads
+bootstrap.wasm in ~0.3 s; a miss recompiles it in ~30 s, and dspy.wasm in
+~60 s), which is host state rather than a property of the component.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 import platform
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 BOUNDS_MS: dict[str, float] = {
-    "run:predict": 50.0,
-    "run:chain-of-thought": 50.0,
-    "run:pipeline-multihop": 150.0,
-    "evaluate:2-rows": 100.0,
-    "compile:bootstrap-few-shot": 150.0,
-    "admit:stale-program-state-refusal": 50.0,
-    "host:tool-envelope": 2.0,
-    "host:calculator-dos-refusal": 5.0,
-    "wasm:bootstrap-instantiate-and-call": 2000.0,
+    "run:predict": 12.0,
+    "run:chain-of-thought": 15.0,
+    "run:pipeline-multihop": 50.0,
+    "evaluate:2-rows": 18.0,
+    "compile:bootstrap-few-shot": 20.0,
+    "admit:stale-program-state-refusal": 4.0,
+    "host:tool-envelope": 0.05,
+    "host:calculator-dos-refusal": 0.1,
+    "host:calculator-nonfinite-refusal": 0.06,
+    # DSPy executing inside dspy.wasm (only measured when it has been built).
+    "wasm:dspy-run-predict": 30.0,
+    "wasm:dspy-compile-labeled-few-shot": 20.0,
 }
+# A ceiling may sit at most this many times above its committed median.
+MAX_HEADROOM = 10.0
 
 
 def _cases() -> dict[str, Callable[[], Any]]:
@@ -170,6 +187,10 @@ def _cases() -> dict[str, Callable[[], Any]]:
         )
         assert "too large" in envelope["error"]
 
+    def nonfinite_refusal() -> None:
+        envelope = json.loads(tools.call(None, "calculator", '{"expression": "1e308 * 1e308"}'))
+        assert "not finite" in envelope["error"]
+
     return {
         "run:predict": predict,
         "run:chain-of-thought": chain_of_thought,
@@ -179,10 +200,11 @@ def _cases() -> dict[str, Callable[[], Any]]:
         "admit:stale-program-state-refusal": stale_refusal,
         "host:tool-envelope": envelope,
         "host:calculator-dos-refusal": dos_refusal,
+        "host:calculator-nonfinite-refusal": nonfinite_refusal,
     }
 
 
-def _wasm_case(component: Path) -> Callable[[], Any] | None:
+def _bootstrap_setup(component: Path) -> Callable[[], Any] | None:
     if not component.exists():
         return None
     import host
@@ -199,6 +221,68 @@ def _wasm_case(component: Path) -> Callable[[], Any] | None:
         assert info["state"] == "BOOTSTRAP" and info["platform"] == "wasi"
 
     return instantiate_and_call
+
+
+PARIS = "[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]"
+
+
+def _dspy_wasm_cases(
+    component: Path,
+) -> tuple[Callable[[], Any] | None, dict[str, Callable[[], Any]]]:
+    """DSPy executing inside dspy.wasm; the host only answers lm/tools calls.
+
+    Returns the one-time instantiation (setup) and the per-call cases.
+    """
+    if not component.exists():
+        return None, {}
+    import host
+
+    def provider() -> host.CompletionProvider:
+        return host.CompletionProvider(
+            static_response=None,
+            base_url=None,
+            api_key=None,
+            upstream_model=None,
+            scripted_responses=[PARIS],
+        )
+
+    # One instance serves every case, created by the setup step; it is never
+    # dropped while measuring, because tearing down a component this size
+    # costs minutes on macOS (wasmtime deregisters its unwind tables one frame
+    # at a time), which would swamp whichever case the collector ran in.
+    shared: list[Any] = []
+
+    def instantiate() -> None:
+        assert not shared, "dspy.wasm is instantiated once per benchmark run"
+        shared.extend(host.instantiate(component, provider()))
+        info = host.call_json(*shared, "runtime-info")
+        assert info["platform"] == "wasi" and info["state"] == "DSPY_IMPORTED", info
+
+    def call(export: str, request: str) -> dict[str, Any]:
+        store, instance = shared
+        return host.call_json(store, instance, export, request)
+
+    run_request = json.dumps({"inputs": {"question": "Capital of France?"}})
+    compile_request = json.dumps(
+        {
+            "program": {"signature": "question -> answer"},
+            "optimizer": "labeled-few-shot",
+            "trainset": [{"question": "France?", "answer": "Paris"}],
+        }
+    )
+
+    def run_predict() -> None:
+        report = call("run", run_request)
+        assert report["state"] == "ALIVE" and report["outputs"] == {"answer": "Paris"}, report
+
+    def compile_labeled() -> None:
+        report = call("compile", compile_request)
+        assert report["state"] == "ALIVE" and report["program_state"]["__subject__"], report
+
+    return instantiate, {
+        "wasm:dspy-run-predict": run_predict,
+        "wasm:dspy-compile-labeled-few-shot": compile_labeled,
+    }
 
 
 def measure(fn: Callable[[], Any], iterations: int, warmup: int = 2) -> dict[str, float]:
@@ -222,16 +306,33 @@ def run_benchmarks(iterations: int = 30, wasm_iterations: int = 5) -> dict[str, 
     import dspy
 
     results = {name: measure(fn, iterations) for name, fn in _cases().items()}
-    wasm = _wasm_case(ROOT / "dist" / "bootstrap.wasm")
-    if wasm is not None:
-        results["wasm:bootstrap-instantiate-and-call"] = measure(wasm, wasm_iterations, warmup=1)
+    # wasmtime-py stores sit in reference cycles; a collection that frees one
+    # mid-measurement bills its (slow) teardown to an unrelated case.
+    setup: dict[str, Any] = {}
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        bootstrap = _bootstrap_setup(ROOT / "dist" / "bootstrap.wasm")
+        if bootstrap is not None:
+            setup["wasm:bootstrap-instantiate-and-call"] = measure(bootstrap, 1, warmup=0)
+        instantiate, cases = _dspy_wasm_cases(ROOT / "dist" / "dspy.wasm")
+        if instantiate is not None:
+            setup["wasm:dspy-instantiate"] = measure(instantiate, 1, warmup=0)
+        for name, fn in cases.items():
+            results[name] = measure(fn, wasm_iterations, warmup=1)
+    finally:
+        if collecting:
+            gc.enable()
     return {
         "schema": "dspy-wasm/bench-receipt/1",
         "python": sys.version.split()[0],
         "platform": f"{platform.system()}-{platform.machine()}",
+        # Host contention while measuring (1/5/15-minute load averages).
+        "load_average": [round(value, 2) for value in os.getloadavg()],
         "dspy": getattr(dspy, "__version__", "unknown"),
         "bounds_median_ms": BOUNDS_MS,
         "results": results,
+        "setup_ms": setup,
         "within_bounds": all(results[name]["median_ms"] <= BOUNDS_MS[name] for name in results),
     }
 
