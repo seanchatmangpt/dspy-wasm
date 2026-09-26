@@ -170,6 +170,14 @@ Step kinds: `program`, `tool`, `retrieve`, `set`, `repeat` (with `until`),
 `foreach` (with `collect`); any step takes `when`. `"$key.path"` references
 state, and `{{key}}` interpolates into strings.
 
+Work is bounded for the whole pipeline, not per level: one `repeat` is at most
+`MAX_REPEAT` (10000) iterations, and one top-level call executes at most
+`MAX_TOTAL_STEPS` (100000) steps across every nesting level. The product of
+nested `repeat`/`foreach` multipliers (including nested pipeline programs) is
+checked before anything runs, and data-dependent `foreach` lengths are charged
+against the same budget while executing; both refuse with `WorkBudgetError`.
+`capabilities` publishes both limits under `pipeline_limits`.
+
 ### Runtime policy
 
 The component has no threads, subprocesses, filesystem or network. Rather than
@@ -197,6 +205,13 @@ supplies deterministic builtin tools: `calculator` (arithmetic only),
 or a small default corpus). `--tool NAME=module:function` grants any host
 Python function as a tool. Host callbacks never raise into the component:
 failures cross as `{"error": ...}` envelopes.
+
+Every guest call (instantiation and each export call) runs under a Wasmtime
+epoch deadline, `--deadline SECONDS` (default 600), re-armed per call. A guest
+that runs past it is interrupted and the host raises `DeadlineExceeded`, so
+the component cannot pin the host even if a request-level bound inside it is
+bypassed. The deadline is wall-clock and includes time spent in host
+callbacks (LM and tool calls); raise it for long real-provider `compile` runs.
 
 ```bash
 python host.py dist/dspy.wasm --capabilities
@@ -281,7 +296,10 @@ Python -> WASM failure.
   stale or tampered state, and a state whose field count does not match.
 - Pipeline step names cannot shadow pipeline attributes (`forward`,
   `outputs`, ...), two different programs cannot share one normalised name,
-  and `repeat` is an integer in `[0, 10000]`.
+  and `repeat` is an integer in `[0, 10000]`; `tests/test_work_budget.py`
+  bounds the whole pipeline's work (nested multipliers) by `MAX_TOTAL_STEPS`.
+- `tests/test_host_deadline.py`: spinning core and component exports are
+  interrupted at the epoch deadline; the deadline is re-armed per call.
 - A tool envelope must carry `result` or `error`; generated tool shims refuse
   names that would shadow `__host_tool__`/`SUBMIT`.
 - `SUBMIT` cannot be swallowed by `except` in interpreted code.

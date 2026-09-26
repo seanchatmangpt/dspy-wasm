@@ -18,13 +18,16 @@ import argparse
 import ast
 import importlib
 import json
+import math
 import operator
 import os
+import threading
 import urllib.request
+import weakref
 from pathlib import Path
 from typing import Any, Callable
 
-from wasmtime import Config, Engine, Store, WasiConfig
+from wasmtime import Config, Engine, Store, Trap, WasiConfig, WasmtimeError
 from wasmtime.component import Component, Linker
 
 
@@ -331,15 +334,116 @@ def load_tool(spec: str) -> tuple[str, Callable[..., Any]]:
 # -------------------------------------------------------------------- runtime
 
 
+# Wall-clock ceiling on one guest call (instantiation or one export call).
+# Enforced by Wasmtime epoch interruption, independently of any request-level
+# check inside the component: a guest that loops (a bypassed pipeline budget,
+# a pathological regex, interpreted code) traps instead of pinning the host.
+DEFAULT_DEADLINE_S = 600.0
+# Epoch tick period: deadlines are enforced with this granularity.
+EPOCH_TICK_S = 0.01
+
+
+class DeadlineExceeded(RuntimeError):
+    """A guest call ran past its epoch deadline and was interrupted."""
+
+
+class _EpochTicker:
+    """One daemon thread advancing the epoch of every live engine."""
+
+    def __init__(self, period: float) -> None:
+        self.period = period
+        self._engines: weakref.WeakSet[Engine] = weakref.WeakSet()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def register(self, engine: Engine) -> None:
+        with self._lock:
+            self._engines.add(engine)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="dspy-wasm-epoch", daemon=True
+                )
+                self._thread.start()
+
+    def _run(self) -> None:
+        event = threading.Event()
+        while True:
+            event.wait(self.period)
+            with self._lock:
+                engines = list(self._engines)
+            for engine in engines:
+                engine.increment_epoch()
+
+
+_TICKER = _EpochTicker(EPOCH_TICK_S)
+
+
+def _deadline_ticks(deadline_s: float) -> int:
+    if isinstance(deadline_s, bool) or not deadline_s > 0 or not math.isfinite(deadline_s):
+        raise ValueError(f"deadline must be a positive finite number of seconds: {deadline_s!r}")
+    return max(1, math.ceil(deadline_s / EPOCH_TICK_S))
+
+
+def new_engine() -> Engine:
+    """Engine with epoch interruption on, ticked by the shared ticker."""
+    config = Config()
+    config.cache = True
+    config.epoch_interruption = True
+    engine = Engine(config)
+    _TICKER.register(engine)
+    return engine
+
+
+def new_store(engine: Engine, deadline_s: float = DEFAULT_DEADLINE_S) -> Store:
+    """Store whose every guest call is bounded by ``deadline_s`` seconds."""
+    store = Store(engine)
+    store.dspy_wasm_deadline_s = deadline_s
+    arm_deadline(store)
+    return store
+
+
+def arm_deadline(store: Store) -> None:
+    """Reset the store's epoch deadline to its full budget from now."""
+    store.set_epoch_deadline(_deadline_ticks(store.dspy_wasm_deadline_s))
+
+
+def guest_call(store: Store, func: Callable[..., Any], *args: Any) -> Any:
+    """Call into the guest under a freshly armed deadline.
+
+    An epoch interruption surfaces as DeadlineExceeded (core calls raise it
+    as a ``Trap``, component calls as a ``WasmtimeError``); every other trap
+    or error propagates unchanged.
+    """
+    arm_deadline(store)
+    try:
+        return func(store, *args)
+    except (Trap, WasmtimeError) as error:
+        if _is_interrupt(error):
+            raise DeadlineExceeded(
+                f"guest call exceeded its {store.dspy_wasm_deadline_s:g} s deadline"
+            ) from error
+        raise
+
+
+# Wasmtime's rendering of TrapCode::Interrupt in a component call error.
+_INTERRUPT_MESSAGE = "wasm trap: interrupt"
+
+
+def _is_interrupt(error: Exception) -> bool:
+    code = getattr(error, "trap_code", None)
+    if code is not None:
+        return getattr(code, "name", "") == "INTERRUPT"
+    return _INTERRUPT_MESSAGE in str(error)
+
+
 def instantiate(
     component_path: Path,
     provider: CompletionProvider,
     tools: ToolProvider | None = None,
+    deadline_s: float = DEFAULT_DEADLINE_S,
 ):
-    config = Config()
-    config.cache = True
-    engine = Engine(config)
-    store = Store(engine)
+    engine = new_engine()
+    store = new_store(engine, deadline_s)
     # WASI grants clocks and entropy only: no preopened directories, no
     # environment, no argv, no network grants. Provider authority stays here.
     wasi = WasiConfig()
@@ -356,7 +460,7 @@ def instantiate(
         with root.add_instance("chatman:dspy/tools@0.1.0") as tool_instance:
             tool_instance.add_func("call", tools.call)
 
-    instance = linker.instantiate(store, component)
+    instance = guest_call(store, linker.instantiate, component)
     return store, instance
 
 
@@ -364,7 +468,7 @@ def call_json(store, instance, export_name: str, *args: str) -> dict[str, Any]:
     func = instance.get_func(store, export_name)
     if func is None:
         raise RuntimeError(f"missing export: {export_name}")
-    result = func(store, *args)
+    result = guest_call(store, func, *args)
     if not isinstance(result, str):
         raise TypeError(f"{export_name} returned non-string result")
     return json.loads(result)
@@ -415,6 +519,13 @@ def main() -> None:
         metavar="JSON|@FILE",
         help="JSON array of passages for the builtin `search`/`embed` tools",
     )
+    parser.add_argument(
+        "--deadline",
+        type=float,
+        default=DEFAULT_DEADLINE_S,
+        metavar="SECONDS",
+        help="wall-clock ceiling on each guest call (Wasmtime epoch interruption)",
+    )
     parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--upstream-model", default=os.environ.get("DSPY_WASM_MODEL"))
@@ -435,7 +546,9 @@ def main() -> None:
         scripted_responses=scripted,
     )
     corpus = Corpus(json.loads(args.corpus)) if args.corpus else None
-    store, instance = instantiate(args.component, provider, ToolProvider(dict(args.tool), corpus))
+    store, instance = instantiate(
+        args.component, provider, ToolProvider(dict(args.tool), corpus), args.deadline
+    )
 
     def emit(report: dict[str, Any]) -> None:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -459,7 +572,7 @@ def main() -> None:
         func = instance.get_func(store, export_name)
         if func is None:
             raise RuntimeError(f"missing export: {export_name}")
-        print(f"{export_name}: {func(store)}")
+        print(f"{export_name}: {guest_call(store, func)}")
 
 
 if __name__ == "__main__":
