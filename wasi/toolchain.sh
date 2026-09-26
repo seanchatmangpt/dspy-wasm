@@ -38,9 +38,12 @@ if [ ! -x "$SDK/bin/clang" ]; then
 fi
 
 # --- host python (same major.minor as the component) --------------------------
+# The interpreter lives under $OUT too: a venv only symlinks to it, so a cached
+# build/wasi restored on another machine would otherwise hold a dangling link.
 HOST_PY="$OUT/host-python"
+export UV_PYTHON_INSTALL_DIR="$OUT/uv-python"
 if [ ! -x "$HOST_PY/bin/python" ]; then
-  uv venv --seed --python "$PYTHON_VERSION" "$HOST_PY"
+  uv venv --clear --seed --managed-python --python "$PYTHON_VERSION" "$HOST_PY"
 fi
 
 # --- CPython source -----------------------------------------------------------
