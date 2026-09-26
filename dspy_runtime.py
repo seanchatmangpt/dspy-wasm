@@ -33,10 +33,14 @@ import io
 import json
 import keyword
 import sys
+from collections.abc import Callable
 from concurrent.futures import Future
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from dspy.primitives.code_interpreter import CodeExecutionError, CodeInterpreterError, FinalOutput
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 # --------------------------------------------------------------- sequential
 
@@ -87,10 +91,10 @@ class SequentialUnbatchify:
     def close(self) -> None:
         self._closed = True
 
-    def __enter__(self) -> SequentialUnbatchify:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, *_: object) -> None:
         self.close()
 
 
@@ -114,8 +118,9 @@ def install_sequential_runtime() -> None:
     parallelizer.ParallelExecutor.__init__ = sequential_init
     concurrent.futures.ThreadPoolExecutor = SequentialExecutor
 
-    import dspy.retrievers.embeddings as embeddings
-    import dspy.utils.unbatchify as unbatchify
+    # Bind the submodules themselves (their Unbatchify globals are patched).
+    import dspy.retrievers.embeddings as embeddings  # noqa: PLR0402
+    import dspy.utils.unbatchify as unbatchify  # noqa: PLR0402
 
     unbatchify.Unbatchify = embeddings.Unbatchify = SequentialUnbatchify
     for module_name in (
@@ -183,11 +188,11 @@ class ComponentInterpreter:
     def shutdown(self) -> None:
         self._namespace = None
 
-    def __enter__(self) -> ComponentInterpreter:
+    def __enter__(self) -> Self:
         self.start()
         return self
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, *_: object) -> None:
         self.shutdown()
 
     def __call__(self, code: str, variables: dict[str, Any] | None = None) -> Any:
@@ -243,7 +248,7 @@ class ComponentInterpreter:
         self._submitted = None
         try:
             with contextlib.redirect_stdout(stdout):
-                exec(compile(tree, "<interpreter>", "exec"), namespace)
+                exec(compile(tree, "<interpreter>", "exec"), namespace)  # noqa: S102 - the interpreter
                 value = (
                     eval(compile(ast.Expression(last.value), "<interpreter>", "eval"), namespace)
                     if last
@@ -253,7 +258,7 @@ class ComponentInterpreter:
             return FinalOutput(_jsonable(submission.value))
         except SyntaxError:
             raise
-        except BaseException as exc:  # noqa: BLE001 - interpreted code may raise anything
+        except BaseException as exc:  # interpreted code may raise anything
             if self._submitted is not None:  # SUBMIT ran, then code raised past it
                 return FinalOutput(_jsonable(self._submitted))
             raise CodeExecutionError(f"{type(exc).__name__}: {exc}") from exc

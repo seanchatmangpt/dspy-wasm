@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-_OUTPUTS = re.compile(r"Your output fields are:\n(.*?)\n(?:All interactions|\Z)", re.S)
-_FIELD = re.compile(r"^\d+\. `(\w+)` \((.*?)\)(?::|$)", re.M)
+_OUTPUTS = re.compile(r"Your output fields are:\n(.*?)\n(?:All interactions|\Z)", re.DOTALL)
+_FIELD = re.compile(r"^\d+\. `(\w+)` \((.*?)\)(?::|$)", re.MULTILINE)
 
 
 def chat(**fields: Any) -> str:

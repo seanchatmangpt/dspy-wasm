@@ -33,10 +33,11 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tomllib
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
@@ -113,9 +114,9 @@ RUSTLS_NATIVE_CERTS_WASI = CratePatch(
         (
             "src/lib.rs",
             '#[cfg(target_os = "macos")]\nuse macos as platform;\n',
-            '#[cfg(target_os = "macos")]\nuse macos as platform;\n\n'
+            ('#[cfg(target_os = "macos")]\nuse macos as platform;\n\n'
             '#[cfg(target_os = "wasi")]\nmod wasi;\n'
-            '#[cfg(target_os = "wasi")]\nuse wasi as platform;\n',
+            '#[cfg(target_os = "wasi")]\nuse wasi as platform;\n'),
         ),
     ),
     files={
@@ -159,11 +160,11 @@ AZURE_IDENTITY_WASI = CratePatch(
     edits=(
         (
             "src/process/tokio.rs",
-            "        ::tokio::process::Command::new(program)\n"
+            ("        ::tokio::process::Command::new(program)\n"
             "            .args(args)\n"
             "            .output()\n"
-            "            .await\n",
-            '        #[cfg(target_os = "wasi")]\n'
+            "            .await\n"),
+            ('        #[cfg(target_os = "wasi")]\n'
             "        {\n"
             "            let _ = (program, args);\n"
             '            return Err(io::Error::new(io::ErrorKind::Unsupported, "WASI has no processes"));\n'
@@ -172,7 +173,7 @@ AZURE_IDENTITY_WASI = CratePatch(
             "        ::tokio::process::Command::new(program)\n"
             "            .args(args)\n"
             "            .output()\n"
-            "            .await\n",
+            "            .await\n"),
         ),
     ),
 )
@@ -217,7 +218,7 @@ OS_STR_BYTES_WASI = CratePatch(
         (
             "src/common/mod.rs",
             '#[cfg(target_os = "wasi")]\nuse std::os::wasi as os;\n',
-            '#[cfg(target_os = "wasi")]\nmod os {\n'
+            ('#[cfg(target_os = "wasi")]\nmod os {\n'
             "    pub(super) mod ffi {\n"
             "        use std::ffi::{OsStr, OsString};\n"
             "        pub(crate) trait OsStrExt {\n"
@@ -247,7 +248,7 @@ OS_STR_BYTES_WASI = CratePatch(
             "            }\n"
             "        }\n"
             "    }\n"
-            "}\n",
+            "}\n"),
         ),
     ),
 )
@@ -261,8 +262,8 @@ AWS_LC_SYS_WASI = CratePatch(
         (
             "aws-lc/crypto/bio/internal.h",
             "#if defined(AF_UNIX) && !defined(OPENSSL_WINDOWS) && !defined(OPENSSL_ANDROID)\n",
-            "#if defined(AF_UNIX) && !defined(OPENSSL_WINDOWS) && !defined(OPENSSL_ANDROID) && \\\n"
-            "    !defined(__wasi__)\n",
+            ("#if defined(AF_UNIX) && !defined(OPENSSL_WINDOWS) && !defined(OPENSSL_ANDROID) && \\\n"
+            "    !defined(__wasi__)\n"),
         ),
         # No terminal on WASI: use the port in console_wasi.c.
         (
@@ -386,12 +387,12 @@ RECIPES: dict[str, Rust | Pep517 | Stdlib] = {
             (
                 "hf_xet/src/legacy/runtime.rs",
                 '#[cfg(windows)]\nextern "system" fn console_ctrl_handler(',
-                '#[cfg(target_os = "wasi")]\n'
+                ('#[cfg(target_os = "wasi")]\n'
                 "fn install_sigint_handler() -> Result<(), RuntimeError> {\n"
                 "    // A WebAssembly component receives no signals; SIGINT cannot arrive.\n"
                 "    Ok(())\n"
                 "}\n\n"
-                '#[cfg(windows)]\nextern "system" fn console_ctrl_handler(',
+                '#[cfg(windows)]\nextern "system" fn console_ctrl_handler('),
             ),
         ),
         crate_patches=(
@@ -435,11 +436,11 @@ RECIPES: dict[str, Rust | Pep517 | Stdlib] = {
             (
                 "litellm/proxy/db/query_engine_reaper.py",
                 "\nimport ctypes\nimport os\n",
-                "\ntry:  # used only on Linux, after the platform check\n"
+                ("\ntry:  # used only on Linux, after the platform check\n"
                 "    import ctypes\n"
                 "except ImportError:  # e.g. WASI: CPython without libffi\n"
                 "    ctypes = None\n"
-                "import os\n",
+                "import os\n"),
             ),
             # componentize-py bounds the bytes a single host call may copy
             # while snapshotting at build time; read the 2.4 MB bundled cost
@@ -447,12 +448,12 @@ RECIPES: dict[str, Rust | Pep517 | Stdlib] = {
             (
                 "litellm/litellm_core_utils/get_model_cost_map.py",
                 '        return files("litellm").joinpath("model_prices_and_context_window_backup.json").read_bytes()\n',
-                '        path = files("litellm").joinpath("model_prices_and_context_window_backup.json")\n'
+                ('        path = files("litellm").joinpath("model_prices_and_context_window_backup.json")\n'
                 "        chunks = []\n"
                 '        with path.open("rb") as handle:\n'
                 "            while chunk := handle.read(1 << 18):\n"
                 "                chunks.append(chunk)\n"
-                '        return b"".join(chunks)\n',
+                '        return b"".join(chunks)\n'),
             ),
             (
                 "litellm-rust/crates/core/Cargo.toml",

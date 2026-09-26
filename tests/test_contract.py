@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 WIT = Path("wit/dspy.wit")
 
 

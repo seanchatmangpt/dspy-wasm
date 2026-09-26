@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("dspy")
 
-import dspy_capabilities as caps  # noqa: E402
+import dspy_capabilities as caps
 
 
 def chat(**fields: object) -> str:

@@ -11,7 +11,25 @@ OUT="${WASI_BUILD_DIR:-$ROOT/build/wasi}"
 WASI_SDK_VERSION="${WASI_SDK_VERSION:-33}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.0}"
 ZLIB_VERSION="${ZLIB_VERSION:-1.3.1}"
-JOBS="${JOBS:-$(nproc)}"
+
+# wasi-sdk publishes host builds for {x86_64,arm64}-{linux,macos}; pick ours.
+case "$(uname -s)" in
+  Linux) SDK_OS=linux ;;
+  Darwin) SDK_OS=macos ;;
+  *) echo "unsupported build host OS: $(uname -s) (need Linux or macOS)" >&2; exit 2 ;;
+esac
+case "$(uname -m)" in
+  x86_64 | amd64) SDK_ARCH=x86_64 ;;
+  arm64 | aarch64) SDK_ARCH=arm64 ;;
+  *) echo "unsupported build host arch: $(uname -m) (need x86_64 or arm64)" >&2; exit 2 ;;
+esac
+host_jobs() {
+  if command -v nproc >/dev/null 2>&1; then nproc
+  elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu
+  else echo 4
+  fi
+}
+JOBS="${JOBS:-$(host_jobs)}"
 
 mkdir -p "$OUT"
 cd "$OUT"
@@ -20,7 +38,7 @@ cd "$OUT"
 SDK="$OUT/wasi-sdk"
 if [ ! -x "$SDK/bin/clang" ]; then
   curl -sSfL -o wasi-sdk.tar.gz \
-    "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+    "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-${SDK_ARCH}-${SDK_OS}.tar.gz"
   rm -rf "$SDK" && mkdir -p "$SDK"
   tar -xzf wasi-sdk.tar.gz -C "$SDK" --strip-components=1
   rm wasi-sdk.tar.gz
@@ -42,11 +60,19 @@ if [ ! -f "$SRC/configure" ]; then
 fi
 
 # Native build python (configure requires an exact-version build interpreter).
+# On macOS (case-insensitive filesystems) CPython names the binary python.exe.
 NATIVE="$SRC/builddir/build"
-if [ ! -x "$NATIVE/python" ]; then
+native_python() {
+  for candidate in "$NATIVE/python" "$NATIVE/python.exe"; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then echo "$candidate"; return 0; fi
+  done
+  return 1
+}
+if ! native_python >/dev/null; then
   mkdir -p "$NATIVE"
   (cd "$NATIVE" && ../../configure --prefix="$NATIVE/install" >/dev/null && make -j"$JOBS" >/dev/null)
 fi
+NATIVE_PY="$(native_python)"
 
 WASI="$SRC/builddir/wasi"
 DEPS="$WASI/deps"
@@ -56,8 +82,10 @@ mkdir -p "$WASI" "$DEPS"
 if [ ! -f "$DEPS/lib/libz.a" ]; then
   curl -sSfL -o zlib.tar.gz "https://zlib.net/fossils/zlib-${ZLIB_VERSION}.tar.gz"
   rm -rf zlib && mkdir zlib && tar -xzf zlib.tar.gz -C zlib --strip-components=1 && rm zlib.tar.gz
-  (cd zlib && CC="$SDK/bin/clang --target=wasm32-wasip2" CFLAGS="-fPIC -O2" AR="$SDK/bin/llvm-ar" \
-     RANLIB="$SDK/bin/llvm-ranlib" ./configure --static --prefix="$DEPS" >/dev/null && make -j"$JOBS" install >/dev/null)
+  # CHOST keeps zlib's configure from probing the build host (on macOS it
+  # would pick Apple libtool, which cannot archive wasm objects).
+  (cd zlib && CHOST=wasm32-wasip2 CC="$SDK/bin/clang --target=wasm32-wasip2" CFLAGS="-fPIC -O2" \
+     AR="$SDK/bin/llvm-ar" ARFLAGS=rc RANLIB="$SDK/bin/llvm-ranlib" ./configure --static --prefix="$DEPS" >/dev/null && make -j"$JOBS" install >/dev/null)
 fi
 
 # --- libyaml for wasm32-wasip2 (PIC), linked statically into PyYAML's _yaml ----
@@ -123,7 +151,7 @@ if [ ! -f "$WASI/libpython3.14.a" ]; then
     ../../Tools/wasm/wasi-env ../../configure -C \
       --host=wasm32-unknown-wasip2 \
       --build="$(../../config.guess)" \
-      --with-build-python="$NATIVE/python" \
+      --with-build-python="$NATIVE_PY" \
       --prefix="$WASI/install" \
       --disable-test-modules \
       --enable-ipv6 >/dev/null
@@ -170,6 +198,11 @@ PY
   mkdir -p "$OUT/bin"
   cp componentize-py-src/target/release/componentize-py "$CPY"
 fi
+# The crate's own test SDKs ship componentize-py.toml + WIT files. Left under
+# the project, `componentize -p .` discovers them as extra main packages and
+# refuses to pick a world ("There are multiple main packages"), so only the
+# binary is kept.
+rm -rf "$OUT/componentize-py-src"
 
 SYSCONFIG_DIR="$(cat "$WASI/pybuilddir.txt")"
 
