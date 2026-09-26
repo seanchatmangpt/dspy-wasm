@@ -16,11 +16,22 @@ JOBS="${JOBS:-$(nproc)}"
 mkdir -p "$OUT"
 cd "$OUT"
 
+# fetch URL DEST SHA256: download with retries and verify the pinned digest,
+# so an error page from a mirror fails here rather than as a tar error later.
+fetch() {
+  curl -sSfL --retry 5 --retry-all-errors -o "$2" "$1"
+  if ! echo "$3  $2" | sha256sum -c --quiet -; then
+    echo "sha256 mismatch for $1" >&2
+    rm -f "$2"
+    exit 1
+  fi
+}
+
 # --- wasi-sdk -----------------------------------------------------------------
 SDK="$OUT/wasi-sdk"
 if [ ! -x "$SDK/bin/clang" ]; then
-  curl -sSfL -o wasi-sdk.tar.gz \
-    "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+  fetch "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz" \
+    wasi-sdk.tar.gz 0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce
   rm -rf "$SDK" && mkdir -p "$SDK"
   tar -xzf wasi-sdk.tar.gz -C "$SDK" --strip-components=1
   rm wasi-sdk.tar.gz
@@ -35,7 +46,8 @@ fi
 # --- CPython source -----------------------------------------------------------
 SRC="$OUT/cpython"
 if [ ! -f "$SRC/configure" ]; then
-  curl -sSfL -o cpython.tar.xz "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz"
+  fetch "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz" \
+    cpython.tar.xz 2299dae542d395ce3883aca00d3c910307cd68e0b2f7336098c8e7b7eee9f3e9
   rm -rf "$SRC" && mkdir -p "$SRC"
   tar -xJf cpython.tar.xz -C "$SRC" --strip-components=1
   rm cpython.tar.xz
@@ -54,7 +66,8 @@ mkdir -p "$WASI" "$DEPS"
 
 # --- zlib for wasm32-wasip2 (PIC) ---------------------------------------------
 if [ ! -f "$DEPS/lib/libz.a" ]; then
-  curl -sSfL -o zlib.tar.gz "https://zlib.net/fossils/zlib-${ZLIB_VERSION}.tar.gz"
+  fetch "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz" \
+    zlib.tar.gz 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
   rm -rf zlib && mkdir zlib && tar -xzf zlib.tar.gz -C zlib --strip-components=1 && rm zlib.tar.gz
   (cd zlib && CC="$SDK/bin/clang --target=wasm32-wasip2" CFLAGS="-fPIC -O2" AR="$SDK/bin/llvm-ar" \
      RANLIB="$SDK/bin/llvm-ranlib" ./configure --static --prefix="$DEPS" >/dev/null && make -j"$JOBS" install >/dev/null)
@@ -63,7 +76,8 @@ fi
 # --- libyaml for wasm32-wasip2 (PIC), linked statically into PyYAML's _yaml ----
 LIBYAML_VERSION="${LIBYAML_VERSION:-0.2.5}"
 if [ ! -f "$DEPS/lib/libyaml.a" ]; then
-  curl -sSfL -o yaml.tar.gz "https://github.com/yaml/libyaml/releases/download/${LIBYAML_VERSION}/yaml-${LIBYAML_VERSION}.tar.gz"
+  fetch "https://github.com/yaml/libyaml/releases/download/${LIBYAML_VERSION}/yaml-${LIBYAML_VERSION}.tar.gz" \
+    yaml.tar.gz c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4
   rm -rf libyaml && mkdir libyaml && tar -xzf yaml.tar.gz -C libyaml --strip-components=1 && rm yaml.tar.gz
   # libyaml's bundled config.sub predates WASI; its sources need no configure.
   (
@@ -85,8 +99,8 @@ fi
 # Unix-domain sockets and no socketpair-based QUIC notifier (absent on WASI).
 OPENSSL_VERSION="${OPENSSL_VERSION:-3.5.4}"
 if [ ! -f "$DEPS/lib/libssl.a" ]; then
-  curl -sSfL -o openssl.tar.gz \
-    "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+  fetch "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+    openssl.tar.gz 967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99
   rm -rf openssl && mkdir openssl && tar -xzf openssl.tar.gz -C openssl --strip-components=1 && rm openssl.tar.gz
   python3 - openssl/crypto/thread/arch/thread_posix.c <<'PY'
 import sys
@@ -151,8 +165,9 @@ COMPONENTIZE_PY_VERSION="${COMPONENTIZE_PY_VERSION:-0.25.1}"
 CPY="$OUT/bin/componentize-py"
 if [ ! -x "$CPY" ]; then
   rm -rf componentize-py-src && mkdir componentize-py-src
-  curl -sSfL "https://static.crates.io/crates/componentize-py/componentize-py-${COMPONENTIZE_PY_VERSION}.crate" \
-    | tar -xz -C componentize-py-src --strip-components=1
+  fetch "https://static.crates.io/crates/componentize-py/componentize-py-${COMPONENTIZE_PY_VERSION}.crate" \
+    componentize-py.crate addb8010b8a05a736a7efaee36975e616bdc4762c458a3ad553405354b90ed47
+  tar -xzf componentize-py.crate -C componentize-py-src --strip-components=1 && rm componentize-py.crate
   python3 - componentize-py-src/src/lib.rs <<'PY'
 import sys
 path = sys.argv[1]
