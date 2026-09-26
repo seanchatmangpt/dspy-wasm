@@ -24,6 +24,7 @@ import csv
 import email.parser
 import hashlib
 import io
+import json
 import os
 import re
 import runpy
@@ -846,18 +847,48 @@ def build_venv(source: Path, recipe: Pep517) -> str:
     """Host-side build environment, created *without* the cross variables.
 
     pip's own isolation would resolve build tools (Cython, ninja, patchelf)
-    for the target platform, i.e. try to compile them for WebAssembly.
+    for the target platform, i.e. try to compile them for WebAssembly. Both the
+    static ``build-system.requires`` and the backend's dynamic
+    ``get_requires_for_build_wheel`` (PEP 517) are installed.
     """
     venv = BUILD / "wasi_venvs" / recipe.sdist
     python = venv / "bin" / "python"
     if not python.exists():
-        requires = tomllib.loads((source / "pyproject.toml").read_text())["build-system"][
-            "requires"
-        ]
+        system = tomllib.loads((source / "pyproject.toml").read_text())["build-system"]
+        requires = list(system["requires"])
         if isinstance(recipe, Meson):
-            requires = [*requires, "ninja"]
+            requires.append("ninja")
         run(["uv", "venv", "--seed", "--python", HOST_PYTHON, str(venv)])
-        run(["uv", "pip", "install", "--python", str(python), "wheel", *requires])
+        run(
+            ["uv", "pip", "install", "--python", str(python), "wheel", "pyproject_hooks", *requires]
+        )
+        probe = (
+            "import json, sys, pyproject_hooks\n"
+            "hooks = pyproject_hooks.BuildBackendHookCaller(\n"
+            "    sys.argv[1], sys.argv[2], backend_path=json.loads(sys.argv[3]))\n"
+            "print(json.dumps(hooks.get_requires_for_build_wheel()))\n"
+        )
+        dynamic = (
+            subprocess.run(
+                [
+                    str(python),
+                    "-c",
+                    probe,
+                    str(source),
+                    system.get("build-backend", "setuptools.build_meta:__legacy__"),
+                    json.dumps(system.get("backend-path")),
+                ],
+                env={**os.environ, **recipe.env},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+            .splitlines()[-1]
+        )
+        extra = [req for req in json.loads(dynamic) if req not in requires]
+        if extra:
+            run(["uv", "pip", "install", "--python", str(python), *extra])
     return str(python)
 
 
