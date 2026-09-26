@@ -6,6 +6,13 @@ interface lm {
     complete: func(request-json: string) -> string;
 }
 
+interface tools {
+    /// Invoke a host-owned tool by name. `args-json` is a JSON object. The
+    /// result is an envelope: {"result": <json>} or {"error": "<message>"}.
+    /// Tools serve as ReAct actions, evaluation metrics and reward functions.
+    call: func(name: string, args-json: string) -> string;
+}
+
 world bootstrap {
     export component-version: func() -> string;
     export runtime-info: func() -> string;
@@ -14,6 +21,7 @@ world bootstrap {
 
 world dspy {
     import lm;
+    import tools;
 
     export component-version: func() -> string;
     export runtime-info: func() -> string;
@@ -24,4 +32,20 @@ world dspy {
 
     /// Execute a DSPy Predict signature using the host-supplied LM capability.
     export predict: func(signature: string, inputs-json: string) -> string;
+
+    /// Describe the modules, adapters, metrics and optimizers available.
+    export capabilities: func() -> string;
+
+    /// Execute a DSPy program spec (any module, adapter, demos, program state,
+    /// host tools) over one input object or a batch.
+    export run: func(request-json: string) -> string;
+
+    /// Format a program spec's prompt messages without calling the LM.
+    export render: func(request-json: string) -> string;
+
+    /// Score a program spec over a devset with a built-in or host-tool metric.
+    export evaluate: func(request-json: string) -> string;
+
+    /// Optimize a program spec; the returned program_state feeds back into run.
+    export compile: func(request-json: string) -> string;
 }

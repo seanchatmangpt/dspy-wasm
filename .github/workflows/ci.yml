@@ -19,13 +19,43 @@ jobs:
 
   dspy-wasm:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: Rust toolchain for wasm32-wasip2
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add wasm32-wasip2
       - run: python -m pip install -e ".[dev,dspy]"
       - run: make test
+
+      # wasi-sdk, CPython 3.14 for WASI, zlib, libyaml, OpenSSL, componentize-py.
+      - name: Cache WASI toolchain
+        uses: actions/cache@v4
+        with:
+          path: build/wasi
+          key: wasi-toolchain-${{ hashFiles('wasi/toolchain.sh') }}
+      - run: make wasi-toolchain
+
+      # Every native dependency cross-compiled from source.
+      - name: Cache WASI wheels
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/wasi_wheels
+            build/sdists
+          key: wasi-wheels-${{ hashFiles('wasi/**') }}
+      - name: Build WASI wheels
+        run: |
+          python wasi/build_wheels.py fetch
+          python wasi/build_wheels.py build --missing
+      - run: python wasi/build_wheels.py install
+
       - run: make dspy
       - run: python host.py dist/dspy.wasm --self-test
       - name: Host-backed Predict
@@ -34,3 +64,17 @@ jobs:
             --predict-signature "question -> answer" \
             --inputs '{"question":"What is the capital of France?"}' \
             --response $'[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]'
+      - name: Capabilities
+        run: python host.py dist/dspy.wasm --capabilities
+      - name: Multi-hop retrieval pipeline
+        run: |
+          python host.py dist/dspy.wasm --run @examples/multihop_pipeline.json \
+            --responses @examples/multihop_responses.json
+      - name: CodeAct over host tools
+        run: |
+          python host.py dist/dspy.wasm --run @examples/code_act.json \
+            --responses @examples/code_act_responses.json
+      - name: Compile with BootstrapFewShot
+        run: |
+          python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
+            --responses @examples/compile_responses.json

@@ -1,0 +1,20 @@
+{
+  "module": "code-act",
+  "tools": [
+    {
+      "name": "calculator",
+      "description": "Evaluate an arithmetic expression.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "inputs": {
+    "question": "What is 6 * 7?"
+  }
+}

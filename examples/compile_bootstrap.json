@@ -1,0 +1,23 @@
+{
+  "program": {
+    "signature": "question -> answer"
+  },
+  "optimizer": "bootstrap-few-shot",
+  "trainset": [
+    {
+      "question": "Capital of France?",
+      "answer": "Paris"
+    },
+    {
+      "question": "Capital of Peru?",
+      "answer": "Lima"
+    }
+  ],
+  "metric": {
+    "tool": "grade_exact"
+  },
+  "config": {
+    "max_bootstrapped_demos": 2,
+    "max_labeled_demos": 0
+  }
+}

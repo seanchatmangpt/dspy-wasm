@@ -1,6 +1,4 @@
-from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-
 
 WIT = Path("wit/dspy.wit")
 
@@ -12,6 +10,10 @@ def test_contract_declares_bootstrap_and_operational_worlds() -> None:
     assert "import lm;" in text
     assert "export run-self-tests: func() -> string;" in text
     assert "export predict: func(signature: string, inputs-json: string) -> string;" in text
+    assert "import tools;" in text
+    assert "call: func(name: string, args-json: string) -> string;" in text
+    for export in ("capabilities", "run", "render", "evaluate", "compile"):
+        assert f"export {export}: func(" in text
 
 
 def test_component_implements_operational_exports() -> None:
@@ -22,20 +24,24 @@ def test_component_implements_operational_exports() -> None:
         "dspy_version",
         "run_self_tests",
         "predict",
+        "capabilities",
+        "run",
+        "render",
+        "evaluate",
+        "compile",
     ):
         assert f"def {method}" in app
 
 
-def test_orjson_projection_covers_dspy_eager_surface() -> None:
-    path = Path("wasm_compat/orjson.py")
-    spec = spec_from_file_location("wasm_orjson", path)
-    assert spec is not None and spec.loader is not None
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    data = module.dumps(
-        {"b": 2, "a": 1},
-        option=module.OPT_SORT_KEYS | module.OPT_APPEND_NEWLINE,
-    )
-    assert data == b'{"a":1,"b":2}\n'
-    assert module.loads(data) == {"a": 1, "b": 2}
+def test_wasi_lock_covers_every_native_recipe() -> None:
+    lock = {
+        line.split("==")[0].lower().replace("_", "-")
+        for line in Path("wasi/requirements.lock").read_text().splitlines()
+        if line and not line.startswith("#")
+    }
+    native = {
+        line.split("==")[0].lower().replace("_", "-")
+        for line in Path("wasi/native.txt").read_text().split()
+    }
+    assert native <= lock, native - lock
+    assert {"numpy", "optuna", "litellm", "dspy"} <= lock

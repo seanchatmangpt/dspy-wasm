@@ -1,0 +1,9 @@
+{"module": "pipeline", "retriever": "search",
+ "steps": [
+   {"set": {"context": []}},
+   {"repeat": 2, "steps": [
+     {"name": "generate_query", "program": {"module": "chain-of-thought", "signature": "context: list[str], question -> query"}},
+     {"retrieve": "$query", "k": 1, "output": "context", "accumulate": ["context"]}]},
+   {"name": "generate_answer", "program": {"module": "chain-of-thought", "signature": "context: list[str], question -> answer"}}],
+ "outputs": ["answer", "context"],
+ "inputs": {"question": "Where was the author of Hamlet born?"}}

@@ -1,0 +1,5 @@
+[
+  "[[ ## reasoning ## ]]\nFind the author.\n\n[[ ## query ## ]]\nWho wrote Hamlet?\n\n[[ ## completed ## ]]",
+  "[[ ## reasoning ## ]]\nFind the birthplace.\n\n[[ ## query ## ]]\nWhere was Shakespeare born?\n\n[[ ## completed ## ]]",
+  "[[ ## reasoning ## ]]\nCombine the hops.\n\n[[ ## answer ## ]]\nStratford-upon-Avon\n\n[[ ## completed ## ]]"
+]
