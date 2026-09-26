@@ -184,6 +184,9 @@ PY
   (cd componentize-py-src && cargo build --release --bin componentize-py >/dev/null 2>&1)
   mkdir -p "$OUT/bin"
   cp componentize-py-src/target/release/componentize-py "$CPY"
+  # The crate ships test SDKs with componentize-py.toml files; left under the
+  # repo, `componentize-py -p .` would discover their WIT worlds.
+  rm -rf componentize-py-src
 fi
 
 SYSCONFIG_DIR="$(cat "$WASI/pybuilddir.txt")"
