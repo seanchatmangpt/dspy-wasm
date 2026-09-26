@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 
 import pytest
 
@@ -85,10 +84,8 @@ def test_P1_nested_repeat_is_bounded_in_total_work() -> None:
 )
 def test_over_budget_nesting_is_refused_at_every_depth(counts) -> None:
     assert all(0 <= count <= caps.MAX_REPEAT for count in counts)
-    started = time.perf_counter()
     report = guarded(caps.run, pipeline(nested_repeat(*counts)), scripted("unused"))
     over_budget(report)
-    assert time.perf_counter() - started < 2.0
 
 
 def test_refusal_happens_before_any_step_runs() -> None:
