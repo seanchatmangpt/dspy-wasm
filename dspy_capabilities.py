@@ -32,6 +32,7 @@ tools too: ``{"retriever": "<tool>"}`` / ``{"embedder": "<tool>"}``.
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import hashlib
 import inspect
@@ -100,9 +101,15 @@ _REF = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
 # Key under which `compile` binds a program_state to the program it was
 # compiled for; `run`/`compile` refuse a state whose subject differs.
 SUBJECT_KEY = "__subject__"
-# Upper bound on pipeline `repeat` iterations: a request cannot pin the
-# component in an unbounded loop.
+# Upper bound on one `repeat` step's iteration count.
 MAX_REPEAT = 10_000
+# Upper bound on the total work of one top-level pipeline call, counted in
+# executed steps across every nesting level (repeat, foreach, nested
+# pipelines). A per-level bound alone is defeated by nesting: three nested
+# `repeat: 10000` steps are 1e12 iterations. The budget is checked statically
+# before execution (product of nested multipliers) and enforced dynamically
+# while executing (data-dependent `foreach` lengths).
+MAX_TOTAL_STEPS = 100_000
 # Names the host-tool shim reserves inside generated tool source.
 _RESERVED_TOOL_NAMES = frozenset({"SUBMIT", "__host_tool__"})
 
@@ -113,6 +120,80 @@ class HostError(RuntimeError):
 
 class RequestError(ValueError):
     """The caller's request is malformed."""
+
+
+class WorkBudgetError(RequestError):
+    """A pipeline's total work exceeds MAX_TOTAL_STEPS."""
+
+
+def _budget_message(work: int) -> str:
+    return (
+        f"pipeline total work {work} steps exceeds MAX_TOTAL_STEPS={MAX_TOTAL_STEPS} "
+        "(product of nested repeat/foreach multipliers)"
+    )
+
+
+class _WorkBudget:
+    """Executed-step counter shared by every pipeline level of one call."""
+
+    __slots__ = ("used",)
+
+    def __init__(self) -> None:
+        self.used = 0
+
+    def charge(self, steps: int = 1) -> None:
+        self.used += steps
+        if self.used > MAX_TOTAL_STEPS:
+            raise WorkBudgetError(_budget_message(self.used))
+
+
+# The budget of the outermost pipeline call in progress; nested pipelines
+# charge the same budget instead of starting their own.
+_WORK_BUDGET: contextvars.ContextVar[_WorkBudget | None] = contextvars.ContextVar(
+    "dspy_wasm_work_budget", default=None
+)
+
+
+def _repeat_times(step: dict[str, Any]) -> int:
+    times = step["repeat"]
+    if isinstance(times, bool) or not isinstance(times, int) or not (0 <= times <= MAX_REPEAT):
+        raise RequestError(f"'repeat' must be an integer in [0, {MAX_REPEAT}]")
+    return times
+
+
+def pipeline_work(steps: Any) -> int:
+    """Worst-case executed-step count of a pipeline step list.
+
+    Every visited step costs 1 (skipped ``when`` steps included); ``repeat``
+    multiplies its body by ``n`` (``until`` may stop early, so it does not
+    lower the bound); ``foreach`` over a literal list multiplies by its
+    length, over a state reference by 1 here and by the real length at run
+    time; a nested pipeline program contributes its own work. Refuses with
+    WorkBudgetError as soon as a partial sum exceeds MAX_TOTAL_STEPS, so the
+    computation itself is bounded.
+    """
+    if not isinstance(steps, list):
+        raise RequestError("pipeline 'steps' must be a JSON array")
+    total = 0
+    for step in steps:
+        if not isinstance(step, dict):
+            raise RequestError("pipeline steps must be JSON objects")
+        work = 1
+        if "repeat" in step:
+            times = _repeat_times(step)
+            work += times * pipeline_work(step.get("steps") or [])
+        elif "foreach" in step:
+            items = step["foreach"]
+            multiplier = len(items) if isinstance(items, list) else 1
+            work += multiplier * pipeline_work(step.get("steps") or [])
+        elif "program" in step:
+            program = step["program"]
+            if isinstance(program, dict) and program.get("module") == "pipeline":
+                work += pipeline_work(program.get("steps") or [])
+        total += work
+        if total > MAX_TOTAL_STEPS:
+            raise WorkBudgetError(_budget_message(total))
+    return total
 
 
 def json_default(value: Any) -> Any:
@@ -555,6 +636,11 @@ class Pipeline(dspy.Module):
     ``repeat`` iterations is one predictor, so optimizers tune it once (the
     multi-hop pattern). Every program step is a named sub-module, so the whole
     pipeline compiles, dumps and loads state like any DSPy program.
+
+    Work is bounded for the whole call: ``pipeline_work`` refuses a spec whose
+    nested repeat/foreach multipliers exceed MAX_TOTAL_STEPS before anything
+    runs, and every executed step (nested pipelines included) is charged to
+    one shared budget, which also bounds data-dependent ``foreach`` lengths.
     """
 
     def __init__(self, spec: dict[str, Any], factory: Callable[[dict[str, Any]], dspy.Module]):
@@ -563,6 +649,8 @@ class Pipeline(dspy.Module):
         self.steps = spec.get("steps") or []
         if not self.steps:
             raise RequestError("pipeline needs non-empty 'steps'")
+        # Refuse over-budget pipelines before any predictor is built or run.
+        pipeline_work(self.steps)
         self._inputs_for: dict[str, list[str] | None] = {}
         self._programs: dict[str, Any] = {}
         self._register(self.steps, factory)
@@ -635,7 +723,9 @@ class Pipeline(dspy.Module):
             state[key] = value
 
     def _execute(self, steps: list[dict[str, Any]], state: dict[str, Any]) -> None:
+        budget = _WORK_BUDGET.get()
         for step in steps:
+            budget.charge()
             if "when" in step and not self._resolve(step["when"], state):
                 continue
             accumulate = set(step.get("accumulate") or [])
@@ -668,14 +758,7 @@ class Pipeline(dspy.Module):
                 for key, expr in step["set"].items():
                     self._store(state, key, self._resolve(expr, state), key in accumulate)
             elif "repeat" in step:
-                times = step["repeat"]
-                if (
-                    isinstance(times, bool)
-                    or not isinstance(times, int)
-                    or not (0 <= times <= MAX_REPEAT)
-                ):
-                    raise RequestError(f"'repeat' must be an integer in [0, {MAX_REPEAT}]")
-                for _ in range(times):
+                for _ in range(_repeat_times(step)):
                     self._execute(step["steps"], state)
                     if "until" in step and self._resolve(step["until"], state):
                         break
@@ -693,7 +776,11 @@ class Pipeline(dspy.Module):
 
     def forward(self, **kwargs: Any) -> dspy.Prediction:
         state = dict(kwargs)
-        self._execute(self.steps, state)
+        token = _WORK_BUDGET.set(_WORK_BUDGET.get() or _WorkBudget())
+        try:
+            self._execute(self.steps, state)
+        finally:
+            _WORK_BUDGET.reset(token)
         keys = self.outputs or [key for key in state if key not in kwargs]
         return dspy.Prediction(**{key: state[key] for key in keys})
 
@@ -1182,6 +1269,7 @@ def describe() -> dict[str, Any]:
         "metrics": list(METRICS),
         "optimizers": list(OPTIMIZERS),
         "pipeline_steps": ["program", "tool", "retrieve", "set", "repeat", "foreach", "when"],
+        "pipeline_limits": {"max_repeat": MAX_REPEAT, "max_total_steps": MAX_TOTAL_STEPS},
         "host_backed": {
             "retriever": "dspy.Retrieve / dspy.settings.rm via a host tool, or "
             "dspy.retrievers.Embeddings in-component over a corpus with a host embedder",
