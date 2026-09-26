@@ -73,6 +73,7 @@ OPTIMIZERS = (
     "bootstrap-few-shot",
     "bootstrap-random-search",
     "knn-few-shot",
+    "bootstrap-optuna",
     "copro",
     "mipro-v2",
     "simba",
@@ -84,10 +85,8 @@ UNSUPPORTED = {
     "optimizer:bootstrap-finetune": "weight training needs a provider fine-tuning authority",
     "optimizer:better-together": "composes bootstrap-finetune",
     "optimizer:grpo": "weight training needs a provider fine-tuning authority",
-    "optimizer:bootstrap-optuna": "optuna TPE with numpy has no WASI build",
     "optimizer:avatar": "operates only on the deprecated Avatar module",
     "module:flex": "optimizer-authored sandbox programs; not yet projected",
-    "retriever:embeddings": "dspy.retrievers.Embeddings needs numpy einsum/faiss; use a host retriever",
     "streaming": "WIT calls are synchronous; use run and read the full result",
 }
 CUSTOM_TYPES = {
@@ -108,7 +107,7 @@ class RequestError(ValueError):
 
 
 def json_default(value: Any) -> Any:
-    if isinstance(value, dspy_runtime.Array):
+    if hasattr(value, "tolist"):  # numpy arrays and scalars
         return value.tolist()
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -815,7 +814,28 @@ class Session:
         self.adapter = build_adapter(spec.get("adapter"), self.lm)
         self.builder = Builder(self.tools)
         self.module = self.builder(spec)
-        self.retriever = self.tools.retriever(spec["retriever"]) if spec.get("retriever") else None
+        self.retriever = self._retriever(spec.get("retriever"))
+
+    def _retriever(self, spec: Any) -> Callable[..., list] | None:
+        """A host tool name, or {"corpus": [...], "embedder": tool, "k": n}
+        for DSPy's own in-component vector index (dspy.retrievers.Embeddings)."""
+        if not spec:
+            return None
+        if isinstance(spec, str):
+            return self.tools.retriever(spec)
+        if not isinstance(spec, dict) or not spec.get("corpus") or not spec.get("embedder"):
+            raise RequestError("retriever objects need 'corpus' and 'embedder'")
+        index = dspy.retrievers.Embeddings(
+            corpus=list(spec["corpus"]),
+            embedder=self.tools.embedder(spec["embedder"]),
+            k=int(spec.get("k", 3)),
+        )
+
+        def rm(query: str, k: int | None = None, **_: Any) -> list:
+            passages = index(query).passages
+            return [dotdict(long_text=p) for p in passages[: k or len(passages)]]
+
+        return rm
 
     def context(self):
         tools = self.tools
@@ -959,6 +979,10 @@ def _optimizer(name: str, config: dict[str, Any], metric, session: Session):
             vectorizer=session.tools.embedder(embedder),
             **config,
         ), {}
+    if name == "bootstrap-optuna":
+        return dspy.BootstrapFewShotWithOptuna(
+            metric=metric, num_threads=1, **{"num_candidate_programs": 2, **config}
+        ), {"max_demos": config.pop("max_demos", 2)}
     if name == "copro":
         return dspy.COPRO(metric=metric, prompt_model=lm, **{"breadth": 2, "depth": 1, **config}), {
             "eval_kwargs": {"num_threads": 1, "display_progress": False}
@@ -1067,15 +1091,16 @@ def describe() -> dict[str, Any]:
         "optimizers": list(OPTIMIZERS),
         "pipeline_steps": ["program", "tool", "retrieve", "set", "repeat", "foreach", "when"],
         "host_backed": {
-            "retriever": "dspy.Retrieve / dspy.settings.rm via a host tool",
+            "retriever": "dspy.Retrieve / dspy.settings.rm via a host tool, or "
+            "dspy.retrievers.Embeddings in-component over a corpus with a host embedder",
             "embedder": "dspy.Embedder (KNN, knn-few-shot) via a host tool",
             "interpreter": "in-component CodeInterpreter for program-of-thought, code-act, rlm",
         },
         "lm_config": [field.name for field in dataclasses.fields(Config)],
-        "substitutions": {
+        "runtime": {
+            "dependencies": "every native dependency is the real library compiled to wasm32-wasip2",
             "parallelism": "sequential: ParallelExecutor pinned to 1 thread, pools run inline",
-            "mipro-v2": "optuna TPE replaced by a seeded random categorical sampler",
-            "numpy": "Embedder/KNN/SIMBA use a pure-Python array/statistics projection",
+            "interpreter": "in-component CPython for program-of-thought, code-act, rlm",
         },
         "unsupported": dict(UNSUPPORTED),
         "limits": {
@@ -1094,4 +1119,3 @@ def guarded(capability: Callable[[], dict[str, Any]]) -> str:
 
 
 dspy_runtime.install_sequential_runtime()
-dspy_runtime.install_numeric_projections()

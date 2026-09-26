@@ -309,6 +309,7 @@ TRAINSET = [
         ("simba", {}),
         ("gepa", {}),
         ("infer-rules", {"num_candidates": 1, "num_rules": 1, "max_bootstrapped_demos": 1}),
+        ("bootstrap-optuna", {"num_candidate_programs": 2, "max_bootstrapped_demos": 1}),
     ],
 )
 def test_optimizers_compile_end_to_end(optimizer: str, config: dict) -> None:
@@ -353,6 +354,24 @@ def test_ensemble_majority_over_program_states() -> None:
         host_tools,
     )
     assert report["members"] == 3 and report["outputs"]["answer"] == "Paris"
+
+
+def test_embeddings_retriever_indexes_a_corpus_in_component() -> None:
+    report = caps.run(
+        {
+            "module": "retrieve",
+            "retriever": {
+                "corpus": ["Paris is the capital of France.", "Lima is the capital of Peru."],
+                "embedder": "embed",
+                "k": 1,
+            },
+            "k": 1,
+            "inputs": {"query": "Which city is in Peru? lima"},
+        },
+        scripted("unused"),
+        host_tools,
+    )
+    assert report["outputs"]["passages"] == ["Lima is the capital of Peru."]
 
 
 def test_unsupported_features_fail_with_reasons() -> None:

@@ -1,14 +1,31 @@
 """Operational DSPy WebAssembly component.
 
-DSPy remains upstream code. WASM-specific policy lives at three boundaries:
-1. native-wheel compatibility supplied by the build,
+DSPy and every dependency are upstream code; native extensions are the real
+libraries compiled to wasm32-wasip2 (see wasi/). Component policy lives at
+three boundaries:
+1. runtime policy for what a component lacks (dspy_runtime.py),
 2. LM actuation supplied by the host through WIT (`chatman:dspy/lm`),
 3. tool actuation supplied by the host through WIT (`chatman:dspy/tools`).
 """
 
 from __future__ import annotations
 
-import copy
+import os
+
+# A component has no .env files and fetches nothing at import: litellm skips
+# dotenv in PRODUCTION mode and uses its bundled model cost map.
+os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+# Import numpy completely before dspy: dspy.utils.lazy_import parks a lazy
+# proxy in sys.modules["numpy"], and numpy's own initialisation re-enters it.
+import numpy  # noqa: E402
+import numpy.fft  # noqa: E402,F401
+import numpy.linalg  # noqa: E402,F401
+import numpy.ma  # noqa: E402,F401
+import numpy.random  # noqa: E402,F401
+
+import copy  # noqa: E402
 import json
 import linecache
 import platform
@@ -41,6 +58,26 @@ import dspy.clients.engines.streaming  # noqa: E402,F401
 import dspy.clients.execution  # noqa: E402,F401
 import dspy.utils.hasher  # noqa: E402,F401
 import gepa.lm  # noqa: E402,F401
+import hashlib  # noqa: E402,F401
+import litellm  # noqa: E402
+import litellm.rust_bridge._native  # noqa: E402,F401
+import optuna  # noqa: E402
+import optuna.samplers  # noqa: E402,F401
+import ssl  # noqa: E402,F401
+
+
+def _materialize_litellm() -> None:
+    """Resolve litellm's lazily imported providers/utilities at build time."""
+    from litellm import _lazy_imports
+
+    for name in list(_lazy_imports._get_lazy_import_registry()):
+        try:
+            getattr(litellm, name)
+        except Exception:  # an optional provider's extra dependency
+            pass
+
+
+_materialize_litellm()
 
 try:  # tqdm's write lock probes multiprocessing; absent under WASI is fine.
     import multiprocessing.synchronize  # noqa: E402,F401
@@ -427,6 +464,73 @@ def _optimizer_case(name: str, config: dict[str, Any]) -> Callable[[], None]:
     return case
 
 
+def _case_native_dependencies() -> None:
+    import orjson
+    import regex
+    import rpds
+    import tiktoken  # noqa: F401
+    import tokenizers
+    import yaml
+
+    for module in (orjson, regex, rpds, yaml, tokenizers, numpy):
+        extensions = [m for m in sys.modules if m.startswith(module.__name__)]
+        assert any(
+            str(getattr(sys.modules[m], "__file__", "")).endswith(".so") for m in extensions
+        ), f"{module.__name__} is not running its compiled extension"
+    assert orjson.dumps({"b": 1, "a": 2}, option=orjson.OPT_SORT_KEYS) == b'{"a":2,"b":1}'
+    assert regex.findall(r"\p{Greek}+", "alpha αβγ") == ["αβγ"]
+    assert yaml.load("a: [1, 2]", Loader=yaml.CSafeLoader) == {"a": [1, 2]}
+
+
+def _case_numpy() -> None:
+    matrix = numpy.array([[4.0, 1.0], [2.0, 3.0]])
+    assert sorted(numpy.linalg.eigvals(matrix).real.round(6).tolist()) == [2.0, 5.0]
+    assert numpy.abs(numpy.fft.fft([1, 0, 0, 0])).tolist() == [1.0, 1.0, 1.0, 1.0]
+    assert float(numpy.percentile([1, 2, 3, 4], 10)) == 1.3
+
+
+def _case_optuna_tpe() -> None:
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=0))
+    study.optimize(lambda trial: -((trial.suggest_float("x", -5, 5) - 2) ** 2), n_trials=20)
+    assert abs(study.best_params["x"] - 2) < 1.0
+
+
+def _case_tls_and_hashlib() -> None:
+    import _hashlib
+
+    context = ssl.create_default_context()
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+    assert ssl.OPENSSL_VERSION.startswith("OpenSSL 3.")
+    assert hashlib.new("sha3_256", b"abc").hexdigest().startswith("3a985da7")
+    assert _hashlib.__file__.endswith(".so")
+
+
+def _case_litellm() -> None:
+    from litellm.rust_bridge import _native
+
+    assert _native.__file__.endswith(".so")
+    assert litellm.model_cost["gpt-4o"]["max_input_tokens"] > 0
+    assert litellm.get_llm_provider("claude-sonnet-4-5")[1] == "anthropic"
+
+
+def _case_embeddings_retriever() -> None:
+    report = _run(
+        {
+            "module": "retrieve",
+            "retriever": {
+                "corpus": ["Paris is the capital of France.", "Lima is the capital of Peru."],
+                "embedder": "embed",
+                "k": 1,
+            },
+            "k": 1,
+            "inputs": {"query": "capital of Peru"},
+        },
+        "unused",
+    )
+    assert report["outputs"]["passages"] == ["Lima is the capital of Peru."]
+
+
 CASES: tuple[tuple[str, Callable[[], None]], ...] = (
     ("example", _case_example),
     ("signature", _case_signature),
@@ -462,6 +566,16 @@ CASES: tuple[tuple[str, Callable[[], None]], ...] = (
         "optimizer:infer-rules",
         _optimizer_case("infer-rules", {"num_candidates": 1, "num_rules": 1}),
     ),
+    (
+        "optimizer:bootstrap-optuna",
+        _optimizer_case("bootstrap-optuna", {"num_candidate_programs": 2}),
+    ),
+    ("native-dependencies", _case_native_dependencies),
+    ("numpy", _case_numpy),
+    ("optuna-tpe", _case_optuna_tpe),
+    ("tls-and-hashlib", _case_tls_and_hashlib),
+    ("litellm", _case_litellm),
+    ("embeddings-retriever", _case_embeddings_retriever),
 )
 
 
@@ -503,6 +617,8 @@ class DspyBindings(wit.DspyBindings):
                 "platform": platform.system(),
                 "dspy": getattr(dspy, "__version__", "unknown"),
                 "lm_boundary": "chatman:dspy/lm@0.1.0",
+                "numpy": numpy.__version__,
+                "openssl": ssl.OPENSSL_VERSION,
                 "tool_boundary": "chatman:dspy/tools@0.1.0",
                 "state": "DSPY_IMPORTED",
             },
@@ -591,4 +707,19 @@ def _freeze_sources(*prefixes: str) -> None:
                 linecache.cache[filename] = (sum(map(len, lines)), None, lines, filename)
 
 
+def _materialize_lazy_modules() -> None:
+    """Import everything dspy's require() deferred, while a filesystem exists.
+
+    inspect.getmodule() (via Module.__getattribute__ -> inspect.stack()) walks
+    sys.modules and touches every entry, which would otherwise trigger those
+    imports at runtime, where no source files exist.
+    """
+    from dspy.utils.lazy_import import _LazyModule
+
+    for module in list(sys.modules.values()):
+        if isinstance(module, _LazyModule):
+            module._load()
+
+
+_materialize_lazy_modules()
 _freeze_sources("dspy.predict", "dspy.primitives", "dspy_capabilities", "dspy_runtime")

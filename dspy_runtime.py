@@ -1,8 +1,9 @@
-"""Runtime projections that let the whole of DSPy run inside one WASM instance.
+"""Runtime policy that lets the whole of DSPy run inside one WASM instance.
 
-The component has no threads, no subprocesses, no filesystem and no network.
-DSPy reaches for all four; this module supplies faithful single-instance
-equivalents instead of disabling features:
+Every dependency is the real library compiled to WebAssembly (see wasi/). What
+remains here is policy for what a component genuinely lacks: threads,
+subprocesses, a filesystem and network. DSPy reaches for all four; this module
+supplies faithful single-instance equivalents instead of disabling features:
 
 - **Sequential execution.** ``ParallelExecutor`` already owns a sequential,
   context-propagating path for ``num_threads == 1``; every executor is pinned
@@ -15,6 +16,10 @@ equivalents instead of disabling features:
   with the exact outcome semantics of DSPy's ``LocalInterpreter`` worker:
   ``FinalOutput`` on ``SUBMIT``, last-expression value or captured stdout,
   ``SyntaxError`` and ``CodeExecutionError`` for failures.
+- **Inline batching.** ``Unbatchify`` (behind ``dspy.retrievers.Embeddings``)
+  coalesces calls on a worker thread; with one caller it runs inline.
+- **Event loop without a self-pipe.** asyncio's cross-thread wake-up channel
+  needs ``socketpair()``, which WASI lacks; with no threads it is unused.
 """
 
 from __future__ import annotations
@@ -56,6 +61,39 @@ class SequentialExecutor(concurrent.futures.Executor):
         self._shutdown = True
 
 
+class SequentialUnbatchify:
+    """``dspy.utils.unbatchify.Unbatchify`` without its worker thread.
+
+    With a single caller the worker always collects exactly one pending item
+    and calls ``batch_fn([item])``; doing that inline is equivalent.
+    """
+
+    def __init__(
+        self,
+        batch_fn: Callable[[list[Any]], list[Any]],
+        max_batch_size: int = 32,
+        max_wait_time: float = 0.1,
+    ) -> None:
+        self.batch_fn = batch_fn
+        self.max_batch_size = max_batch_size
+        self.max_wait_time = max_wait_time
+        self._closed = False
+
+    def __call__(self, input_item: Any) -> Any:
+        if self._closed:
+            raise RuntimeError("Unbatchify is closed")
+        return self.batch_fn([input_item])[0]
+
+    def close(self) -> None:
+        self._closed = True
+
+    def __enter__(self) -> SequentialUnbatchify:
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
 _INSTALLED = False
 
 
@@ -75,6 +113,11 @@ def install_sequential_runtime() -> None:
 
     parallelizer.ParallelExecutor.__init__ = sequential_init
     concurrent.futures.ThreadPoolExecutor = SequentialExecutor
+
+    import dspy.retrievers.embeddings as embeddings
+    import dspy.utils.unbatchify as unbatchify
+
+    unbatchify.Unbatchify = embeddings.Unbatchify = SequentialUnbatchify
     for module_name in (
         "dspy.predict.rlm",
         "dspy.teleprompt.avatar_optimizer",
@@ -207,259 +250,6 @@ class ComponentInterpreter:
         captured = stdout.getvalue().rstrip("\n")
         value = _jsonable(value)
         return value if value is not None else (captured or None)
-
-
-# ----------------------------------------------------------- numeric projection
-
-
-class Array:
-    """1-D/2-D float array: the numpy surface dspy.Embedder and dspy.KNN use.
-
-    Injected only into ``dspy.clients.embedding`` and ``dspy.predict.knn`` (never
-    registered as ``numpy``), so libraries probing for numpy are unaffected.
-    """
-
-    __slots__ = ("rows",)
-
-    def __init__(self, data: Any) -> None:
-        if isinstance(data, Array):
-            data = data.tolist()
-        data = list(data)
-        self.rows = [
-            [float(x) for x in row] if isinstance(row, (list, tuple, Array)) else float(row)
-            for row in (r.tolist() if isinstance(r, Array) else r for r in data)
-        ]
-
-    @property
-    def ndim(self) -> int:
-        return 2 if self.rows and isinstance(self.rows[0], list) else 1
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return (len(self.rows), len(self.rows[0])) if self.ndim == 2 else (len(self.rows),)
-
-    @property
-    def T(self) -> Array:  # noqa: N802 - numpy name
-        if self.ndim == 1:
-            return Array(self.rows)
-        return Array([list(column) for column in zip(*self.rows)])
-
-    def tolist(self) -> list:
-        return [list(row) if isinstance(row, list) else row for row in self.rows]
-
-    def astype(self, _dtype: Any) -> Array:
-        return Array(self.rows)
-
-    def squeeze(self) -> Array:
-        if self.ndim == 2 and self.shape[1] == 1:
-            return Array([row[0] for row in self.rows])
-        if self.ndim == 2 and self.shape[0] == 1:
-            return Array(self.rows[0])
-        return Array(self.rows)
-
-    def argsort(self) -> Array:
-        order = sorted(range(len(self.rows)), key=lambda index: self.rows[index])
-        return _IndexArray(order)
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __iter__(self):
-        for row in self.rows:
-            yield Array(row) if isinstance(row, list) else row
-
-    def __getitem__(self, key: Any) -> Any:
-        value = self.rows[key]
-        if isinstance(key, slice):
-            return Array(value)
-        return Array(value) if isinstance(value, list) else value
-
-    def __repr__(self) -> str:
-        return f"Array({self.rows!r})"
-
-
-class _IndexArray(list):
-    def __getitem__(self, key: Any) -> Any:
-        value = list.__getitem__(self, key)
-        return _IndexArray(value) if isinstance(key, slice) else value
-
-
-def _dot(left: Array, right: Array) -> Array:
-    left, right = Array(left), Array(right)
-    if left.ndim == 1 and right.ndim == 1:
-        return sum(a * b for a, b in zip(left.rows, right.rows))
-    columns = right.T.rows if right.ndim == 2 else [right.rows]
-    if left.ndim == 1:
-        return Array([sum(a * b for a, b in zip(left.rows, column)) for column in columns])
-    result = [[sum(a * b for a, b in zip(row, column)) for column in columns] for row in left.rows]
-    return Array(result if right.ndim == 2 else [row[0] for row in result])
-
-
-class _Generator:
-    """``numpy.random.Generator`` surface SIMBA uses (seeded, deterministic)."""
-
-    def __init__(self, seed: int | None = None) -> None:
-        import random
-
-        self._rng = random.Random(seed)
-
-    def poisson(self, lam: float) -> int:
-        # Knuth's algorithm; SIMBA draws small rates (demos / max_demos).
-        import math
-
-        limit, count, product = math.exp(-lam), 0, self._rng.random()
-        while product > limit:
-            count += 1
-            product *= self._rng.random()
-        return count
-
-    def random(self) -> float:
-        return self._rng.random()
-
-    def choice(self, options: Any) -> Any:
-        return self._rng.choice(list(options))
-
-
-class _Random:
-    def __init__(self) -> None:
-        import random
-
-        self._rng = random.Random(0)
-
-    @staticmethod
-    def default_rng(seed: int | None = None) -> _Generator:
-        return _Generator(seed)
-
-    def rand(self, *shape: int) -> Array:
-        if len(shape) == 1:
-            return Array([self._rng.random() for _ in range(shape[0])])
-        return Array([[self._rng.random() for _ in range(shape[1])] for _ in range(shape[0])])
-
-
-class numeric:  # noqa: N801 - stands in for the `np` module object
-    float32 = "float32"
-    ndarray = Array
-    random = _Random()
-
-    @staticmethod
-    def array(data: Any, dtype: Any = None) -> Array:
-        return Array(data)
-
-    asarray = array
-    dot = staticmethod(_dot)
-
-    @staticmethod
-    def exp(value: float) -> float:
-        import math
-
-        return math.exp(value)
-
-    @staticmethod
-    def percentile(values: Any, q: float) -> float:
-        """numpy's default ('linear') interpolation."""
-        ordered = sorted(float(v) for v in values)
-        if not ordered:
-            raise ValueError("percentile of empty sequence")
-        position = (len(ordered) - 1) * q / 100
-        low = int(position)
-        high = min(low + 1, len(ordered) - 1)
-        return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
-
-
-# ------------------------------------------------------------ search projection
-
-
-class _Trial:
-    def __init__(self, study: Any = None, params: dict | None = None, value: Any = None) -> None:
-        self._study = study
-        self.number = 0
-        self.params = dict(params or {})
-        self.value = value
-
-    def suggest_categorical(self, name: str, choices: Any) -> Any:
-        choices = list(choices)
-        value = self._study._rng.choice(choices)
-        self.params[name] = value
-        return value
-
-
-class _Study:
-    def __init__(self, direction: str = "maximize", sampler: Any = None) -> None:
-        import random
-
-        self.direction = direction
-        self.trials: list[_Trial] = []
-        self._rng = random.Random(getattr(sampler, "seed", None))
-
-    def add_trial(self, trial: _Trial) -> None:
-        trial.number = len(self.trials)
-        self.trials.append(trial)
-
-    def optimize(self, objective: Callable[[_Trial], Any], n_trials: int) -> None:
-        for _ in range(n_trials):
-            trial = _Trial(self)
-            trial.number = len(self.trials)
-            trial.value = objective(trial)
-            self.trials.append(trial)
-
-    @property
-    def best_trial(self) -> _Trial:
-        scored = [trial for trial in self.trials if trial.value is not None]
-        pick = max if self.direction == "maximize" else min
-        return pick(scored, key=lambda trial: trial.value)
-
-
-class search:  # noqa: N801 - stands in for the `optuna` module object
-    """Optuna surface MIPROv2 uses, with a *seeded random* categorical sampler.
-
-    Optuna hard-depends on numpy (no WASI build). MIPROv2 only needs a
-    categorical search over (instruction, demo-set) candidates; this projection
-    keeps MIPROv2's proposal, minibatch and full-eval logic intact and swaps TPE
-    for seeded random sampling. Capabilities report the substitution.
-    """
-
-    class logging:  # noqa: N801
-        WARNING = 30
-
-        @staticmethod
-        def set_verbosity(_level: int) -> None:
-            return None
-
-    class samplers:  # noqa: N801
-        class TPESampler:
-            def __init__(self, seed: int | None = None, **_kwargs: Any) -> None:
-                self.seed = seed
-
-    class distributions:  # noqa: N801
-        class CategoricalDistribution:
-            def __init__(self, choices: Any) -> None:
-                self.choices = tuple(choices)
-
-    class trial:  # noqa: N801
-        Trial = _Trial
-
-        @staticmethod
-        def create_trial(*, params: dict, distributions: dict, value: Any) -> _Trial:
-            return _Trial(params=params, value=value)
-
-    Study = _Study
-
-    @staticmethod
-    def create_study(direction: str = "maximize", sampler: Any = None, **_kwargs: Any) -> _Study:
-        return _Study(direction, sampler)
-
-
-def install_numeric_projections() -> None:
-    """Point Embedder/KNN/SIMBA at ``numeric`` and MIPROv2 at ``search``."""
-    import dspy.clients.embedding as embedding
-    import dspy.predict.knn as knn
-    import dspy.teleprompt.mipro_optimizer_v2 as mipro
-    import dspy.teleprompt.simba as simba
-
-    embedding.np = numeric
-    knn.np = numeric
-    simba.np = numeric
-    mipro._import_optuna = lambda: search
 
 
 # ------------------------------------------------------------------ event loop

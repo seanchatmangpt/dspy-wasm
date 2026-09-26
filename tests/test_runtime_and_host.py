@@ -49,35 +49,22 @@ def test_sequential_executor_is_a_drop_in_pool() -> None:
     assert list(rt.SequentialExecutor().map(str, [1, 2])) == ["1", "2"]
 
 
+def test_sequential_unbatchify_matches_single_caller_semantics() -> None:
+    batches = []
+    unbatch = rt.SequentialUnbatchify(
+        lambda items: batches.append(list(items)) or [i * 2 for i in items]
+    )
+    assert [unbatch(1), unbatch(2)] == [2, 4] and batches == [[1], [2]]
+    unbatch.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        unbatch(3)
+
+
 def test_parallel_executor_pinned_to_sequential_path() -> None:
     rt.install_sequential_runtime()
     from dspy.utils.parallelizer import ParallelExecutor
 
     assert ParallelExecutor(num_threads=16).num_threads == 1
-
-
-def test_numeric_projection_matches_numpy_semantics() -> None:
-    np = rt.numeric
-    matrix = np.array([[1, 0], [0, 1], [1, 1]], dtype=np.float32).astype(np.float32)
-    scores = np.dot(matrix, np.array([[1, 0]]).T).squeeze()
-    assert scores.tolist() == [1.0, 0.0, 1.0]
-    assert list(scores.argsort()[-2:][::-1]) == [2, 0]
-    assert np.percentile([1, 2, 3, 4], 10) == pytest.approx(1.3)
-    assert np.percentile([1, 2, 3, 4], 90) == pytest.approx(3.7)
-    draws = [np.random.default_rng(0).poisson(0.5) for _ in range(3)]
-    assert len(set(draws)) == 1  # seeded
-
-
-def test_search_projection_drives_categorical_study() -> None:
-    study = rt.search.create_study(
-        direction="maximize", sampler=rt.search.samplers.TPESampler(seed=1)
-    )
-    study.add_trial(rt.search.trial.create_trial(params={}, distributions={}, value=0.1))
-    study.optimize(
-        lambda trial: {"a": 1.0, "b": 0.5}[trial.suggest_categorical("x", ["a", "b"])], 5
-    )
-    assert [t.number for t in study.trials] == list(range(6))
-    assert study.best_trial.value == 1.0
 
 
 def test_event_loop_runs_without_self_pipe() -> None:
