@@ -1,0 +1,74 @@
+{
+  "bounds_median_ms": {
+    "admit:stale-program-state-refusal": 50.0,
+    "compile:bootstrap-few-shot": 150.0,
+    "evaluate:2-rows": 100.0,
+    "host:calculator-dos-refusal": 5.0,
+    "host:tool-envelope": 2.0,
+    "run:chain-of-thought": 50.0,
+    "run:pipeline-multihop": 150.0,
+    "run:predict": 50.0,
+    "wasm:bootstrap-instantiate-and-call": 2000.0
+  },
+  "dspy": "3.4.0",
+  "platform": "Darwin-arm64",
+  "python": "3.12.12",
+  "results": {
+    "admit:stale-program-state-refusal": {
+      "iterations": 30,
+      "median_ms": 0.646,
+      "min_ms": 0.614,
+      "p95_ms": 1.7336
+    },
+    "compile:bootstrap-few-shot": {
+      "iterations": 30,
+      "median_ms": 3.3682,
+      "min_ms": 2.7325,
+      "p95_ms": 11.0524
+    },
+    "evaluate:2-rows": {
+      "iterations": 30,
+      "median_ms": 2.8445,
+      "min_ms": 2.3492,
+      "p95_ms": 5.3621
+    },
+    "host:calculator-dos-refusal": {
+      "iterations": 30,
+      "median_ms": 0.0145,
+      "min_ms": 0.0143,
+      "p95_ms": 0.0151
+    },
+    "host:tool-envelope": {
+      "iterations": 30,
+      "median_ms": 0.0067,
+      "min_ms": 0.0065,
+      "p95_ms": 0.0075
+    },
+    "run:chain-of-thought": {
+      "iterations": 30,
+      "median_ms": 2.1571,
+      "min_ms": 1.9922,
+      "p95_ms": 2.4945
+    },
+    "run:pipeline-multihop": {
+      "iterations": 30,
+      "median_ms": 7.4406,
+      "min_ms": 6.6289,
+      "p95_ms": 27.2674
+    },
+    "run:predict": {
+      "iterations": 30,
+      "median_ms": 1.6782,
+      "min_ms": 1.4829,
+      "p95_ms": 2.1358
+    },
+    "wasm:bootstrap-instantiate-and-call": {
+      "iterations": 5,
+      "median_ms": 298.4783,
+      "min_ms": 283.542,
+      "p95_ms": 396.4168
+    }
+  },
+  "schema": "dspy-wasm/bench-receipt/1",
+  "within_bounds": true
+}

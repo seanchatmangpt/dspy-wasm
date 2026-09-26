@@ -76,6 +76,11 @@ class CompletionProvider:
         upstream_model: str | None,
         scripted_responses: list[str] | None = None,
     ) -> None:
+        if scripted_responses is not None and (
+            not isinstance(scripted_responses, list)
+            or not all(isinstance(text, str) for text in scripted_responses)
+        ):
+            raise TypeError("scripted responses must be a JSON array of strings")
         self.static_response = static_response
         self.scripted_responses = list(scripted_responses or [])
         self.base_url = base_url
@@ -169,17 +174,40 @@ _ARITHMETIC: dict[type, Callable[..., Any]] = {
 }
 
 
+# Largest integer magnitude (in bits) the calculator will produce. Without it
+# nested powers such as ((10**64)**64)**64 grow the host's memory and time
+# doubly exponentially while every single exponent stays within bounds.
+MAX_INT_BITS = 4096
+
+
+def _bounded(value: Any) -> Any:
+    if isinstance(value, complex):
+        raise ValueError("result is not a real number")
+    if isinstance(value, int) and value.bit_length() > MAX_INT_BITS:
+        raise ValueError("result too large")
+    return value
+
+
 def _arithmetic(node: ast.AST) -> Any:
     if isinstance(node, ast.Expression):
         return _arithmetic(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return _bounded(node.value)
     if isinstance(node, ast.BinOp) and type(node.op) in _ARITHMETIC:
-        if isinstance(node.op, ast.Pow) and abs(_arithmetic(node.right)) > 64:
-            raise ValueError("exponent too large")
-        return _ARITHMETIC[type(node.op)](_arithmetic(node.left), _arithmetic(node.right))
+        left, right = _arithmetic(node.left), _arithmetic(node.right)
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 64:
+                raise ValueError("exponent too large")
+            # |left ** right| < 2 ** (bit_length(left) * right): refuse before computing.
+            if (
+                isinstance(left, int)
+                and isinstance(right, int)
+                and left.bit_length() * right > MAX_INT_BITS
+            ):
+                raise ValueError("result too large")
+        return _bounded(_ARITHMETIC[type(node.op)](left, right))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ARITHMETIC:
-        return _ARITHMETIC[type(node.op)](_arithmetic(node.operand))
+        return _bounded(_ARITHMETIC[type(node.op)](_arithmetic(node.operand)))
     raise ValueError(f"unsupported expression element: {type(node).__name__}")
 
 
@@ -223,6 +251,14 @@ class Corpus:
 
     def search(self, query: str, k: int = 3) -> list[str]:
         """Retriever tool: passages ranked by query-term overlap."""
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError("k must be a non-negative integer")
+        if k < 0:
+            raise ValueError("k must be a non-negative integer")
+        if not isinstance(query, str):
+            raise TypeError("query must be a string")
+        if k == 0:
+            return []
         wanted = set(_terms(query))
         ranked = sorted(
             self.passages, key=lambda p: (-len(wanted & set(_terms(p))), self.passages.index(p))
@@ -234,6 +270,12 @@ class Corpus:
         """Embedder tool: L2-normalised hashed bag-of-words vectors."""
         import hashlib
 
+        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+            raise TypeError("texts must be a JSON array of strings")
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int):
+            raise TypeError("dimensions must be a positive integer")
+        if dimensions < 1:
+            raise ValueError("dimensions must be a positive integer")
         vectors = []
         for text in texts:
             vector = [0.0] * dimensions

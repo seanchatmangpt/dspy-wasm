@@ -33,6 +33,7 @@ tools too: ``{"retriever": "<tool>"}`` / ``{"embedder": "<tool>"}``.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
 import json
 import keyword
@@ -96,6 +97,14 @@ CUSTOM_TYPES = {
 }
 _USAGE_FIELDS = tuple(field.name for field in dataclasses.fields(Usage))
 _REF = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
+# Key under which `compile` binds a program_state to the program it was
+# compiled for; `run`/`compile` refuse a state whose subject differs.
+SUBJECT_KEY = "__subject__"
+# Upper bound on pipeline `repeat` iterations: a request cannot pin the
+# component in an unbounded loop.
+MAX_REPEAT = 10_000
+# Names the host-tool shim reserves inside generated tool source.
+_RESERVED_TOOL_NAMES = frozenset({"SUBMIT", "__host_tool__"})
 
 
 class HostError(RuntimeError):
@@ -230,6 +239,17 @@ def build_lm(lm_spec: dict[str, Any] | None, engine: HostEngine) -> dspy.LM:
 # ------------------------------------------------------------------------ tools
 
 
+def _usable_identifier(name: Any) -> bool:
+    """A non-keyword identifier that cannot shadow the tool shim's own names."""
+    return (
+        isinstance(name, str)
+        and name.isidentifier()
+        and not keyword.iskeyword(name)
+        and name not in _RESERVED_TOOL_NAMES
+        and not name.startswith("__")
+    )
+
+
 class HostTools:
     """The ``chatman:dspy/tools`` capability, shaped for DSPy's call sites."""
 
@@ -245,7 +265,9 @@ class HostTools:
             raise HostError(f"host tool {name!r} returned a non-envelope value")
         if raw.get("error") is not None:
             raise HostError(f"host tool {name!r} failed: {raw['error']}")
-        return raw.get("result")
+        if "result" not in raw:
+            raise HostError(f"host tool {name!r} returned an envelope without 'result' or 'error'")
+        return raw["result"]
 
     def function(self, spec: dict[str, Any]) -> Callable[..., Any]:
         """A real, named Python function whose source is registered.
@@ -255,12 +277,12 @@ class HostTools:
         that ``ComponentInterpreter`` provides rather than a closure.
         """
         name = spec.get("name")
-        if not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name):
+        if not _usable_identifier(name):
             raise RequestError(f"tool name {name!r} must be a Python identifier")
         properties = (spec.get("parameters") or {}).get("properties", {})
         required = set((spec.get("parameters") or {}).get("required", properties))
         for arg in properties:
-            if not arg.isidentifier() or keyword.iskeyword(arg):
+            if not _usable_identifier(arg):
                 raise RequestError(f"tool {name!r} argument {arg!r} must be a Python identifier")
         params = [a for a in properties if a in required] + [
             f"{a}=None" for a in properties if a not in required
@@ -542,6 +564,7 @@ class Pipeline(dspy.Module):
         if not self.steps:
             raise RequestError("pipeline needs non-empty 'steps'")
         self._inputs_for: dict[str, list[str] | None] = {}
+        self._programs: dict[str, Any] = {}
         self._register(self.steps, factory)
 
     def _register(self, steps: list[dict[str, Any]], factory) -> None:
@@ -551,10 +574,30 @@ class Pipeline(dspy.Module):
                 if not name:
                     raise RequestError("program steps need a 'name'")
                 attribute = _identifier(name)
-                if attribute not in self._inputs_for:
-                    program = step["program"]
-                    setattr(self, attribute, factory(program))
-                    self._inputs_for[attribute] = program_inputs(program)
+                program = step["program"]
+                if attribute in self._programs:
+                    # Reuse by name is the multi-hop pattern: one predictor.
+                    # Two different programs normalising to one attribute
+                    # would silently run the first for both, so refuse.
+                    if self._programs[attribute] != program:
+                        raise RequestError(
+                            f"program step {name!r} collides with a different program "
+                            f"registered as {attribute!r}"
+                        )
+                    continue
+                # Instance state (outputs, steps, callbacks, ...), the host
+                # tools handle set by Builder, and class members (forward, ...).
+                if (
+                    attribute == "_tools"
+                    or attribute in vars(self)
+                    or hasattr(type(self), attribute)
+                ):
+                    raise RequestError(
+                        f"program step name {name!r} shadows pipeline attribute {attribute!r}"
+                    )
+                setattr(self, attribute, factory(program))
+                self._programs[attribute] = program
+                self._inputs_for[attribute] = program_inputs(program)
             for key in ("steps",):
                 if key in step:
                     self._register(step[key], factory)
@@ -625,7 +668,14 @@ class Pipeline(dspy.Module):
                 for key, expr in step["set"].items():
                     self._store(state, key, self._resolve(expr, state), key in accumulate)
             elif "repeat" in step:
-                for _ in range(int(step["repeat"])):
+                times = step["repeat"]
+                if (
+                    isinstance(times, bool)
+                    or not isinstance(times, int)
+                    or not (0 <= times <= MAX_REPEAT)
+                ):
+                    raise RequestError(f"'repeat' must be an integer in [0, {MAX_REPEAT}]")
+                for _ in range(times):
                     self._execute(step["steps"], state)
                     if "until" in step and self._resolve(step["until"], state):
                         break
@@ -664,6 +714,45 @@ def _signature_keys(spec: dict[str, Any]) -> dict[str, Any]:
     return {key: spec[key] for key in ("signature", "instructions") if key in spec}
 
 
+def program_subject(module: dspy.Module) -> str:
+    """Digest of a program's parameter structure: predictor names and fields.
+
+    Two programs share a subject exactly when a program_state dumped from one
+    loads field-for-field into the other.
+    """
+    shape = [[name, list(p.signature.fields)] for name, p in module.named_predictors()]
+    canonical = json.dumps(shape, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def admit_program_state(module: dspy.Module, state: Any) -> dict[str, Any]:
+    """Refuse a program_state that does not belong to ``module``.
+
+    DSPy's own ``Signature.load_state`` zips saved fields onto the current
+    signature non-strictly, so a state compiled for a different signature
+    would otherwise load silently with its prefixes and demos misapplied.
+    """
+    if not isinstance(state, dict):
+        raise RequestError("program_state must be a JSON object")
+    body = {key: value for key, value in state.items() if key != SUBJECT_KEY}
+    expected = program_subject(module)
+    subject = state.get(SUBJECT_KEY)
+    if subject is not None and subject != expected:
+        raise RequestError(f"stale program_state: compiled for {subject}, program is {expected}")
+    for name, predictor in module.named_predictors():
+        entry = body if name == "self" else body.get(name)
+        if not isinstance(entry, dict) or not isinstance(entry.get("signature"), dict):
+            raise RequestError(f"program_state has no state for predictor {name!r}")
+        saved = entry["signature"].get("fields")
+        if not isinstance(saved, list) or len(saved) != len(predictor.signature.fields):
+            raise RequestError(
+                f"program_state for predictor {name!r} has "
+                f"{len(saved) if isinstance(saved, list) else 'no'} fields; "
+                f"signature has {len(predictor.signature.fields)}"
+            )
+    return body
+
+
 class Builder:
     """Turns program specs into DSPy modules against one set of host tools."""
 
@@ -688,7 +777,7 @@ class Builder:
             for predictor in module.predictors():
                 predictor.demos = list(demos)
         if spec.get("program_state"):
-            module.load_state(spec["program_state"])
+            module.load_state(admit_program_state(module, spec["program_state"]))
         return module
 
     def _signature(self, spec: dict[str, Any]) -> type[dspy.Signature]:
@@ -1066,7 +1155,10 @@ def compile_program(
         report = {
             "state": "ALIVE",
             "optimizer": name,
-            "program_state": json.loads(json.dumps(compiled.dump_state(), default=json_default)),
+            "program_state": {
+                **json.loads(json.dumps(compiled.dump_state(), default=json_default)),
+                SUBJECT_KEY: program_subject(compiled),
+            },
             "demos": {n: len(p.demos) for n, p in compiled.named_predictors()},
             "instructions": {n: p.signature.instructions for n, p in compiled.named_predictors()},
             **_accounting(session.engine, False),

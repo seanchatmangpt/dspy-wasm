@@ -272,6 +272,29 @@ make host-bootstrap
 A DSPy dependency failure therefore cannot be misclassified as a generic
 Python -> WASM failure.
 
+## Boundary guards and benchmark
+
+`tests/test_hardening.py` pins the refusals the boundary relies on:
+
+- `compile` binds `program_state` to its program under `__subject__` (a
+  digest of predictor names and signature fields); `run`/`compile` refuse a
+  stale or tampered state, and a state whose field count does not match.
+- Pipeline step names cannot shadow pipeline attributes (`forward`,
+  `outputs`, ...), two different programs cannot share one normalised name,
+  and `repeat` is an integer in `[0, 10000]`.
+- A tool envelope must carry `result` or `error`; generated tool shims refuse
+  names that would shadow `__host_tool__`/`SUBMIT`.
+- `SUBMIT` cannot be swallowed by `except` in interpreted code.
+- Host tools: `calculator` refuses results above 4096 bits and non-real
+  values; `search` needs `k >= 0`; `embed` needs an array of strings.
+
+```bash
+make bench   # writes bench/receipt.json; medians bounded by BOUNDS_MS
+```
+
+`tests/test_bench_bounds.py` reruns every case and fails when a median
+exceeds its ceiling.
+
 ## Evidence
 
 Repository/CI execution establishes repository-local component behavior only.

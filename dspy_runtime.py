@@ -133,7 +133,11 @@ def install_sequential_runtime() -> None:
 # -------------------------------------------------------------- interpreter
 
 
-class _Submission(Exception):
+class _Submission(BaseException):
+    """Raised by SUBMIT. A ``BaseException`` so ``except Exception`` in
+    interpreted code cannot swallow it; ``ComponentInterpreter`` also records
+    the submission, so even a bare ``except:`` cannot discard it."""
+
     def __init__(self, value: Any) -> None:
         super().__init__("SUBMIT")
         self.value = value
@@ -170,6 +174,7 @@ class ComponentInterpreter:
         self.bridge = bridge
         self._tools_registered = False
         self._namespace: dict[str, Any] | None = None
+        self._submitted: dict[str, Any] | None = None
 
     def start(self) -> None:
         if self._namespace is None:
@@ -192,13 +197,15 @@ class ComponentInterpreter:
         if self.output_fields is None:
             if len(args) != 1 or kwargs:
                 raise TypeError("SUBMIT requires one output value")
-            raise _Submission({"output": args[0]})
+            self._submitted = {"output": args[0]}
+            raise _Submission(self._submitted)
         names = [field["name"] for field in self.output_fields]
         if args and kwargs:
             raise TypeError("SUBMIT accepts positional or keyword values, not both")
         values = dict(zip(names, args)) if args else dict(kwargs)
         if set(values) != set(names) or len(args) > len(names):
             raise TypeError("SUBMIT fields do not match the configured output fields")
+        self._submitted = values
         raise _Submission(values)
 
     def _configure(self) -> dict[str, Any]:
@@ -233,6 +240,7 @@ class ComponentInterpreter:
         tree = ast.parse(code, mode="exec")  # SyntaxError propagates, as the protocol requires
         last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
         stdout = io.StringIO()
+        self._submitted = None
         try:
             with contextlib.redirect_stdout(stdout):
                 exec(compile(tree, "<interpreter>", "exec"), namespace)
@@ -246,7 +254,11 @@ class ComponentInterpreter:
         except SyntaxError:
             raise
         except BaseException as exc:  # noqa: BLE001 - interpreted code may raise anything
+            if self._submitted is not None:  # SUBMIT ran, then code raised past it
+                return FinalOutput(_jsonable(self._submitted))
             raise CodeExecutionError(f"{type(exc).__name__}: {exc}") from exc
+        if self._submitted is not None:  # SUBMIT ran and interpreted code swallowed it
+            return FinalOutput(_jsonable(self._submitted))
         captured = stdout.getvalue().rstrip("\n")
         value = _jsonable(value)
         return value if value is not None else (captured or None)

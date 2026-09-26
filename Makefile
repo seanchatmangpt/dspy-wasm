@@ -1,4 +1,4 @@
-.PHONY: install install-dspy bindings wasi-toolchain wasi-wheels wasi-deps bootstrap dspy host-bootstrap host-dspy wasm-test test clean
+.PHONY: install install-dspy bindings wasi-toolchain wasi-wheels wasi-deps bootstrap dspy host-bootstrap host-dspy wasm-test test bench clean
 
 # The DSPy component is built with componentize-py 0.25.1 compiled from its
 # published crate with a raised build-time hostcall budget (wasi/toolchain.sh).
@@ -58,6 +58,11 @@ wasm-test:
 
 test:
 	python -m pytest -q
+
+# Timing receipt for the capability boundary (and bootstrap.wasm when built);
+# medians are bounded by bench/bench_capabilities.py BOUNDS_MS.
+bench:
+	python bench/bench_capabilities.py --write bench/receipt.json
 
 clean:
 	rm -rf build dist
