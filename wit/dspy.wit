@@ -1,0 +1,27 @@
+package chatman:dspy@0.1.0;
+
+interface lm {
+    /// Complete one canonical DSPy LM request. Payloads are JSON so the
+    /// provider/runtime remains outside the Python component.
+    complete: func(request-json: string) -> string;
+}
+
+world bootstrap {
+    export component-version: func() -> string;
+    export runtime-info: func() -> string;
+    export dspy-version: func() -> string;
+}
+
+world dspy {
+    import lm;
+
+    export component-version: func() -> string;
+    export runtime-info: func() -> string;
+    export dspy-version: func() -> string;
+
+    /// Execute representative upstream DSPy behavioral courts inside WASM.
+    export run-self-tests: func() -> string;
+
+    /// Execute a DSPy Predict signature using the host-supplied LM capability.
+    export predict: func(signature: string, inputs-json: string) -> string;
+}

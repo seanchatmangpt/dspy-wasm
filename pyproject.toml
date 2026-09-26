@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dspy-wasm"
+version = "0.1.0"
+description = "DSPy packaged behind a WebAssembly Component Model boundary"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "componentize-py==0.25.0",
+    "wasmtime==48.0.0",
+]
+
+[project.optional-dependencies]
+dspy = [
+    "dspy==3.4.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.setuptools]
+py-modules = []
