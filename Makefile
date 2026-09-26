@@ -25,17 +25,17 @@ wasi-deps:
 		--index-url https://benbrandt.github.io/wasi-wheels/ \
 		--extra-index-url https://pypi.org/simple \
 		--upgrade \
-		"pydantic>=2.11.0" "regex>=2023.10.3"
+		"pydantic>=2.11.0" "regex>=2023.10.3" charset-normalizer
 
 bootstrap:
 	mkdir -p dist
-	componentize-py -d wit -w bootstrap --world-module dspy_bindings componentize --stub-wasi -p . bootstrap -o dist/bootstrap.wasm
+	componentize-py -d wit -w bootstrap --world-module dspy_bindings componentize --stub-wasi -p . bootstrap_app -o dist/bootstrap.wasm
 
 dspy: wasi-deps
 	mkdir -p dist
-	componentize-py -d wit -w dspy \
+	componentize-py -d wit -w dspy --world-module dspy_bindings \
 		--import-interface-name chatman:dspy/lm@0.1.0=host_lm \
-		componentize --stub-wasi \
+		componentize \
 		-p wasm_compat -p . -p build/wasi_deps \
 		app -o dist/dspy.wasm
 

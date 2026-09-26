@@ -32,10 +32,26 @@ python -m pip install -e ".[dev,dspy]"
 make dspy
 ```
 
-`make dspy` installs a WASI overlay for `pydantic-core` and `regex` from
-the WASI wheels index before componentizing. DSPy's eager `orjson` usage is
-covered by `wasm_compat/orjson.py`, a deliberately narrow compatibility
-projection implementing only the API DSPy 3.4 uses on this path.
+`componentize-py` is pinned to 0.17.2, the last release that embeds CPython
+3.12; later releases embed 3.14, for which no WASI `pydantic-core` wheels
+exist. `make dspy` installs a WASI overlay for `pydantic-core`, `regex` and
+the pure-Python `charset-normalizer` from the WASI wheels index before
+componentizing.
+
+Native modules DSPy imports eagerly but without WASI builds are covered by
+deliberately narrow projections in `wasm_compat/`:
+
+| module   | reached via                    | projection                                   |
+|----------|--------------------------------|----------------------------------------------|
+| `orjson` | DSPy                           | `dumps`/`loads` + the 3 option flags used    |
+| `rpds`   | `jsonschema -> referencing`    | persistent map/set/list, copy-on-write       |
+| `jiter`  | `openai` (streaming helpers)   | complete-document `from_json`; partial traps |
+| `zlib`   | `urllib3` (HTTP body decoding) | import-only; any compression call traps      |
+
+The DSPy component is built **without** `--stub-wasi`. The host links WASI
+with no preopened directories, environment, argv, or network grants: the
+component receives clocks and entropy (DSPy timestamps LM history and mints
+UUIDs) and nothing else.
 
 The generated artifact is:
 

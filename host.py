@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from wasmtime import Config, Engine, Store
+from wasmtime import Config, Engine, Store, WasiConfig
 from wasmtime.component import Component, Linker
 
 
@@ -89,8 +89,14 @@ def instantiate(component_path: Path, provider: CompletionProvider):
     config.cache = True
     engine = Engine(config)
     store = Store(engine)
+    # WASI grants clocks and entropy only: no preopened directories, no
+    # environment, no argv, no network grants. Provider authority stays here.
+    wasi = WasiConfig()
+    wasi.inherit_stderr()
+    store.set_wasi(wasi)
     component = Component.from_file(engine, str(component_path))
     linker = Linker(engine)
+    linker.add_wasip2()
 
     with linker.root() as root:
         with root.add_instance("chatman:dspy/lm@0.1.0") as lm:

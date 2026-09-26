@@ -23,6 +23,17 @@ from dspy.lm15 import Message, Response, Usage
 from dspy.utils.dummies import DummyLM
 from dspy_bindings.imports import host_lm
 
+# componentize-py snapshots the interpreter after module import, and the host
+# grants no filesystem. Anything DSPy would import lazily on a call path must
+# therefore be imported here, at build time.
+import cachetools  # noqa: E402,F401
+import cachetools.keys  # noqa: E402,F401
+import dspy.clients.call_result  # noqa: E402,F401
+import dspy.clients.costs  # noqa: E402,F401
+import dspy.clients.engines.dummy_engine  # noqa: E402,F401
+import dspy.clients.engines.streaming  # noqa: E402,F401
+import dspy.clients.execution  # noqa: E402,F401
+
 
 def _json_default(value: Any) -> Any:
     if hasattr(value, "model_dump"):
