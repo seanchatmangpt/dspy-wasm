@@ -64,7 +64,8 @@ defmodule DspyWasm.ConformanceTest do
     refute DspyWasm.Requirement.satisfied?(%{operator: :gte, bound: 90}, 50.0)
   end
 
-  test "an LM-call budget aborts a runaway compile and the host recovers", %{host: _} do
+  test "an LM-call budget aborts a compile that stays inside the request limits and the host recovers",
+       %{host: _} do
     lm = fn _ -> {:ok, Jason.encode!(%{"text" => @answer})} end
     {:ok, host} = DspyWasm.Host.start_link(path: @path, lm: lm, budget: [max_lm_calls: 25])
     assert :ok = DspyWasm.Host.await_ready(host)
@@ -76,7 +77,7 @@ defmodule DspyWasm.ConformanceTest do
         "trainset" => [%{"question" => "a", "answer" => "x"}, %{"question" => "b", "answer" => "y"}],
         "metric" => "exact_match",
         "config" => %{
-          "num_candidate_programs" => 1_000_000,
+          "num_candidate_programs" => 1000,
           "max_bootstrapped_demos" => 1,
           "max_labeled_demos" => 0
         }
