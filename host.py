@@ -147,17 +147,24 @@ class CompletionProvider:
         with urllib.request.urlopen(http_request, timeout=120) as response:
             payload = json.loads(response.read())
 
-        choice = payload["choices"][0]
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not choices:
+            raise RuntimeError("provider returned no choices")
+        choice = choices[0]
+        text = (choice.get("message") or {}).get("content")
+        if not isinstance(text, str):
+            raise TypeError("provider returned no text content (refusal or tool-only reply)")
         usage = payload.get("usage") or {}
         return {
             "id": payload.get("id"),
             "model": payload.get("model", model),
-            "text": choice["message"]["content"],
-            "finish_reason": choice.get("finish_reason", "stop"),
+            "text": text,
+            "finish_reason": choice.get("finish_reason") or "stop",
             "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
+                # Providers may send null counts; the component only counts integers.
+                "input_tokens": usage.get("prompt_tokens") or 0,
+                "output_tokens": usage.get("completion_tokens") or 0,
+                "total_tokens": usage.get("total_tokens") or 0,
             },
         }
 
@@ -220,7 +227,10 @@ def _arithmetic(node: ast.AST) -> Any:
 
 def calculator(expression: str) -> Any:
     """Evaluate a pure arithmetic expression (no names, calls or attributes)."""
-    return _arithmetic(ast.parse(expression, mode="eval"))
+    try:
+        return _arithmetic(ast.parse(expression, mode="eval"))
+    except OverflowError as exc:  # float conversion of a large int, or float ** float
+        raise ValueError(f"result too large: {exc}") from None
 
 
 def echo(**kwargs: Any) -> Any:
@@ -234,6 +244,10 @@ def grade_exact(example: dict, prediction: dict, field: str = "answer") -> dict[
     actual = str(prediction.get(field, "")).strip().lower()
     return {"score": float(expected == actual)}
 
+
+# Ceilings on one `embed` call: its output is len(texts) * dimensions floats.
+MAX_EMBED_DIMENSIONS = 4096
+MAX_EMBED_TEXTS = 10_000
 
 DEFAULT_CORPUS = (
     "Hamlet was written by William Shakespeare.",
@@ -281,8 +295,10 @@ class Corpus:
             raise TypeError("texts must be a JSON array of strings")
         if isinstance(dimensions, bool) or not isinstance(dimensions, int):
             raise TypeError("dimensions must be a positive integer")
-        if dimensions < 1:
-            raise ValueError("dimensions must be a positive integer")
+        if not 1 <= dimensions <= MAX_EMBED_DIMENSIONS:
+            raise ValueError(f"dimensions must be an integer in [1, {MAX_EMBED_DIMENSIONS}]")
+        if len(texts) > MAX_EMBED_TEXTS:
+            raise ValueError(f"at most {MAX_EMBED_TEXTS} texts per call")
         vectors = []
         for text in texts:
             vector = [0.0] * dimensions
@@ -333,7 +349,16 @@ def load_tool(spec: str) -> tuple[str, Callable[..., Any]]:
     module_name, _, attribute = target.partition(":")
     if not name or not module_name or not attribute:
         raise argparse.ArgumentTypeError("--tool expects NAME=package.module:function")
-    return name, getattr(importlib.import_module(module_name), attribute)
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise argparse.ArgumentTypeError(f"cannot import {module_name!r}: {exc}") from None
+    function = getattr(module, attribute, None)
+    if function is None:
+        raise argparse.ArgumentTypeError(f"{module_name!r} has no attribute {attribute!r}")
+    if not callable(function):
+        raise argparse.ArgumentTypeError(f"{module_name}:{attribute} is not callable")
+    return name, function
 
 
 # -------------------------------------------------------------------- runtime
@@ -481,9 +506,35 @@ def call_json(store, instance, export_name: str, *args: str) -> dict[str, Any]:
 
 def _request(value: str) -> str:
     """Accept inline JSON or ``@path/to/request.json``."""
-    text = Path(value[1:]).read_text() if value.startswith("@") else value
-    json.loads(text)
+    try:
+        text = Path(value[1:]).read_text() if value.startswith("@") else value
+    except OSError as exc:
+        raise argparse.ArgumentTypeError(f"cannot read {value[1:]!r}: {exc.strerror}") from None
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from None
     return text
+
+
+def _strings(value: str) -> list[str]:
+    """Inline JSON or ``@file`` holding an array of strings."""
+    items = json.loads(_request(value))
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        raise argparse.ArgumentTypeError("expected a JSON array of strings")
+    return items
+
+
+def _deadline(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = math.nan
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            f"deadline must be a positive finite number, got {value!r}"
+        )
+    return seconds
 
 
 REQUEST_EXPORTS = ("run", "render", "evaluate", "compile")
@@ -506,7 +557,7 @@ def main() -> None:
     parser.add_argument("--response")
     parser.add_argument(
         "--responses",
-        type=_request,
+        type=_strings,
         metavar="JSON|@FILE",
         help="JSON array of LM responses returned in order (the last one repeats)",
     )
@@ -520,13 +571,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--corpus",
-        type=_request,
+        type=_strings,
         metavar="JSON|@FILE",
         help="JSON array of passages for the builtin `search`/`embed` tools",
     )
     parser.add_argument(
         "--deadline",
-        type=float,
+        type=_deadline,
         default=DEFAULT_DEADLINE_S,
         metavar="SECONDS",
         help="wall-clock ceiling on each guest call (Wasmtime epoch interruption)",
@@ -536,7 +587,7 @@ def main() -> None:
     parser.add_argument("--upstream-model", default=os.environ.get("DSPY_WASM_MODEL"))
     args = parser.parse_args()
 
-    scripted = json.loads(args.responses) if args.responses else None
+    scripted = args.responses or None
     # Deterministic static response is the default only for tests/inspection.
     # Explicit real-provider configuration disables it.
     static_response = args.response
@@ -550,7 +601,7 @@ def main() -> None:
         upstream_model=args.upstream_model,
         scripted_responses=scripted,
     )
-    corpus = Corpus(json.loads(args.corpus)) if args.corpus else None
+    corpus = Corpus(args.corpus) if args.corpus else None
     store, instance = instantiate(
         args.component, provider, ToolProvider(dict(args.tool), corpus), args.deadline
     )
