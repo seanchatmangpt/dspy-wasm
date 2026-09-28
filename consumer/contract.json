@@ -26,5 +26,19 @@
     "render",
     "evaluate",
     "compile"
-  ]
+  ],
+  "limits": {
+    "max_repeat": 10000,
+    "max_total_steps": 100000,
+    "max_fanout": 100,
+    "max_iters": 1000,
+    "max_int_bits": 4096,
+    "max_embed_dimensions": 4096,
+    "max_embed_texts": 10000,
+    "max_embed_values": 1048576,
+    "deadline_s": 600.0,
+    "max_lm_calls": 20000,
+    "max_tool_calls": 100000,
+    "max_reply_bytes": 268435456
+  }
 }

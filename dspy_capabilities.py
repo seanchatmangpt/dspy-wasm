@@ -51,6 +51,7 @@ from dspy.evaluate.metrics import EM, F1, normalize_text
 from dspy.lm15 import Config, Message, Response, Usage
 
 import dspy_runtime
+import limits
 
 # Load numpy completely now (app.py does the same for the component). If dspy
 # was imported first, sys.modules["numpy"] is dspy.utils.lazy_import's proxy,
@@ -111,20 +112,20 @@ _REF = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
 # compiled for; `run`/`compile` refuse a state whose subject differs.
 SUBJECT_KEY = "__subject__"
 # Upper bound on one `repeat` step's iteration count.
-MAX_REPEAT = 10_000
+MAX_REPEAT = int(limits.value("max_repeat"))
 # Upper bound on the total work of one top-level pipeline call, counted in
 # executed steps across every nesting level (repeat, foreach, nested
 # pipelines). A per-level bound alone is defeated by nesting: three nested
 # `repeat: 10000` steps are 1e12 iterations. The budget is checked statically
 # before execution (product of nested multipliers) and enforced dynamically
 # while executing (data-dependent `foreach` lengths).
-MAX_TOTAL_STEPS = 100_000
+MAX_TOTAL_STEPS = int(limits.value("max_total_steps"))
 # Upper bounds on one module's fan-out (samples n/m, retrieval k) and on its
 # iteration counts (max_iters, max_llm_calls). Each is an LM or tool call
 # multiplier that repeat/foreach budgets do not see; without a ceiling only
 # the host's wall-clock deadline stops `majority` with n=1e9.
-MAX_FANOUT = 100
-MAX_ITERS = 1_000
+MAX_FANOUT = int(limits.value("max_fanout"))
+MAX_ITERS = int(limits.value("max_iters"))
 # Names the host-tool shim reserves inside generated tool source.
 _RESERVED_TOOL_NAMES = frozenset({"SUBMIT", "__host_tool__"})
 

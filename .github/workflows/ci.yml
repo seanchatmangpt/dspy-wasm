@@ -3,6 +3,12 @@ name: component-courts
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      clean_cache:
+        description: Build the WASI toolchain and wheels from scratch (no cache restore)
+        type: boolean
+        default: false
 
 jobs:
   bootstrap:
@@ -39,9 +45,13 @@ jobs:
       # skip, and this job (the only one with dspy) then runs 212 of 214.
       - run: make bootstrap
       - run: make test
+        env:
+          DSPY_WASM_FORBID_SKIPS: "1"
+      - run: rustc --version && cargo --version
 
       # wasi-sdk, CPython 3.14 for WASI, zlib, libyaml, OpenSSL, componentize-py.
       - name: Cache WASI toolchain
+        if: ${{ !inputs.clean_cache }}
         uses: actions/cache@v4
         with:
           path: build/wasi
@@ -50,6 +60,7 @@ jobs:
 
       # Every native dependency cross-compiled from source.
       - name: Cache WASI wheels
+        if: ${{ !inputs.clean_cache }}
         uses: actions/cache@v4
         with:
           path: |
@@ -79,6 +90,16 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - run: python host.py dist/dspy.wasm --self-test
+      - name: Conformance suite
+        run: python host.py dist/dspy.wasm --conformance
+      - name: Host budget aborts a runaway compile
+        run: |
+          if python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
+              --responses @examples/compile_responses.json --max-lm-calls 1; then
+            echo "budget was not enforced"; exit 1
+          else
+            test $? -eq 3
+          fi
       - name: Host-backed Predict
         run: |
           python host.py dist/dspy.wasm \
