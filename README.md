@@ -242,6 +242,13 @@ that runs past it is interrupted and the host raises `DeadlineExceeded`, so
 the component cannot pin the host even if a request-level bound inside it is
 bypassed. The deadline is wall-clock and includes time spent in host
 callbacks (LM and tool calls); raise it for long real-provider `compile` runs.
+After `DeadlineExceeded` the instance is trapped and cannot be re-entered
+(`wasm trap: cannot enter component instance`); instantiate a fresh one.
+
+Not bounded by a request-level limit, only by that deadline: the length of a
+batch `inputs` array, dataset sizes, and the counts inside an optimizer
+`config` (`max_rounds`, `num_candidate_programs`, `num_trials`, ...), which
+pass through to DSPy unchanged.
 
 ```bash
 python host.py dist/dspy.wasm --capabilities
@@ -345,8 +352,8 @@ Python -> WASM failure.
 - Host tools: `calculator` refuses results above 4096 bits (powers are
   refused before they are computed), non-real and non-finite values; every
   tool envelope is strict JSON (no `Infinity`/`NaN`); `search` needs
-  `k >= 0`; `embed` needs an array of at most 10000 strings and
-  `dimensions` in `[1, 4096]`; float overflow is a refusal, not a crash.
+  `k >= 0`; `embed` needs an array of at most 10000 strings,
+  `dimensions` in `[1, 4096]` and at most 1048576 values (`texts x dimensions`); float overflow is a refusal, not a crash.
 
 `tests/test_production_boundary.py` pins the refusals found against 8321947:
 optimizer `compile()` options (`sample`, `max_demos`) never reach the

@@ -35,6 +35,9 @@ jobs:
           rustup default stable
           rustup target add wasm32-wasip2
       - run: python -m pip install -e ".[dev,dspy]"
+      # Build first: without dist/bootstrap.wasm the two epoch-deadline tests
+      # skip, and this job (the only one with dspy) then runs 212 of 214.
+      - run: make bootstrap
       - run: make test
 
       # wasi-sdk, CPython 3.14 for WASI, zlib, libyaml, OpenSSL, componentize-py.

@@ -245,9 +245,12 @@ def grade_exact(example: dict, prediction: dict, field: str = "answer") -> dict[
     return {"score": float(expected == actual)}
 
 
-# Ceilings on one `embed` call: its output is len(texts) * dimensions floats.
+# Ceilings on one `embed` call: its output is len(texts) * dimensions floats,
+# so the product is bounded too (both axis ceilings together were 41M floats,
+# a 205 MB reply).
 MAX_EMBED_DIMENSIONS = 4096
 MAX_EMBED_TEXTS = 10_000
+MAX_EMBED_VALUES = 1_048_576
 
 DEFAULT_CORPUS = (
     "Hamlet was written by William Shakespeare.",
@@ -299,6 +302,10 @@ class Corpus:
             raise ValueError(f"dimensions must be an integer in [1, {MAX_EMBED_DIMENSIONS}]")
         if len(texts) > MAX_EMBED_TEXTS:
             raise ValueError(f"at most {MAX_EMBED_TEXTS} texts per call")
+        if len(texts) * dimensions > MAX_EMBED_VALUES:
+            raise ValueError(
+                f"texts x dimensions must not exceed {MAX_EMBED_VALUES} values per call"
+            )
         vectors = []
         for text in texts:
             vector = [0.0] * dimensions
