@@ -126,6 +126,9 @@ MAX_TOTAL_STEPS = int(limits.value("max_total_steps"))
 # the host's wall-clock deadline stops `majority` with n=1e9.
 MAX_FANOUT = int(limits.value("max_fanout"))
 MAX_ITERS = int(limits.value("max_iters"))
+MAX_BATCH_ITEMS = int(limits.value("max_batch_items"))
+MAX_DATASET_ITEMS = int(limits.value("max_dataset_items"))
+MAX_OPTIMIZER_COUNT = int(limits.value("max_optimizer_count"))
 # Names the host-tool shim reserves inside generated tool source.
 _RESERVED_TOOL_NAMES = frozenset({"SUBMIT", "__host_tool__"})
 
@@ -182,6 +185,67 @@ def _bounded_int(spec: dict[str, Any], key: str, default: int, low: int, high: i
     if isinstance(value, bool) or not isinstance(value, int) or not (low <= value <= high):
         raise RequestError(f"{key!r} must be an integer in [{low}, {high}]")
     return value
+
+
+_BOOTSTRAP_COUNTS = frozenset(
+    {"max_bootstrapped_demos", "max_labeled_demos", "max_rounds", "max_errors"}
+)
+
+# Count-like integer knobs per optimizer: each multiplies LM calls or program
+# runs, so each is bounded to [0, MAX_OPTIMIZER_COUNT]. An allow-list, not a
+# blanket rule: every other key passes through to upstream untouched.
+OPTIMIZER_COUNT_KEYS: dict[str, frozenset[str]] = {
+    "labeled-few-shot": frozenset({"k"}),
+    "bootstrap-few-shot": _BOOTSTRAP_COUNTS,
+    "bootstrap-random-search": _BOOTSTRAP_COUNTS | {"num_candidate_programs"},
+    "knn-few-shot": frozenset({"k"}),
+    "bootstrap-optuna": _BOOTSTRAP_COUNTS | {"num_candidate_programs", "max_demos"},
+    "copro": frozenset({"breadth", "depth"}),
+    "mipro-v2": _BOOTSTRAP_COUNTS
+    | {
+        "num_candidates",
+        "num_trials",
+        "num_fewshot_candidates",
+        "num_instruct_candidates",
+        "minibatch_size",
+        "max_errors",
+        "num_threads",
+    },
+    "simba": frozenset(
+        {"bsize", "num_candidates", "max_steps", "max_demos", "num_threads", "max_errors"}
+    ),
+    "gepa": frozenset(
+        {
+            "max_metric_calls",
+            "max_full_evals",
+            "reflection_minibatch_size",
+            "num_threads",
+            "max_errors",
+        }
+    ),
+    "infer-rules": frozenset({"num_candidates", "num_rules", "num_threads", "max_errors"}),
+    "ensemble": frozenset({"size"}),
+}
+
+
+def _bound_counts(name: str, config: dict[str, Any], where: str) -> None:
+    """Refuse a count knob outside [0, MAX_OPTIMIZER_COUNT] before any work runs."""
+    for key in OPTIMIZER_COUNT_KEYS.get(name, ()):
+        if key in config:
+            try:
+                _bounded_int(config, key, 0, 0, MAX_OPTIMIZER_COUNT)
+            except RequestError as exc:
+                raise RequestError(f"{where}: {exc}") from None
+    nested = config.get("few_shot_bootstrap_args")  # knn-few-shot -> BootstrapFewShot
+    if name == "knn-few-shot" and isinstance(nested, dict):
+        _bound_counts("bootstrap-few-shot", nested, f"{where}.few_shot_bootstrap_args")
+
+
+def _check_rows(rows: Any, label: str) -> None:
+    if isinstance(rows, list) and len(rows) > MAX_DATASET_ITEMS:
+        raise RequestError(
+            f"{label!r} has {len(rows)} rows; at most {MAX_DATASET_ITEMS} (max_dataset_items)"
+        )
 
 
 def _fanout(spec: dict[str, Any], key: str, default: int, low: int = 1) -> int:
@@ -1098,7 +1162,10 @@ class Session:
             return build_signature(self.spec.get("signature", "question -> answer"))
         return None
 
-    def examples(self, rows: Any, input_keys: list[str] | None) -> list[dspy.Example]:
+    def examples(
+        self, rows: Any, input_keys: list[str] | None, label: str = "dataset"
+    ) -> list[dspy.Example]:
+        _check_rows(rows, label)
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise RequestError("datasets must be JSON arrays of objects")
         if input_keys is not None and (
@@ -1137,6 +1204,10 @@ def run(request: dict[str, Any], lm_call: LmCall, tool_call: ToolCall) -> dict[s
     signature = session.signature()
     with session.context():
         if isinstance(inputs, list):
+            if len(inputs) > MAX_BATCH_ITEMS:
+                raise RequestError(
+                    f"'inputs' has {len(inputs)} items; at most {MAX_BATCH_ITEMS} (max_batch_items)"
+                )
             examples = [
                 dspy.Example(**coerce_inputs(signature, item)).with_inputs(*item) for item in inputs
             ]
@@ -1203,14 +1274,19 @@ def evaluate(request: dict[str, Any], lm_call: LmCall, tool_call: ToolCall) -> d
     """Upstream ``dspy.Evaluate`` (on DSPy's sequential executor path)."""
     program = request.get("program") or {}
     session = Session(program, lm_call, tool_call)
-    devset = session.examples(request.get("devset"), request.get("input_keys"))
+    devset = session.examples(request.get("devset"), request.get("input_keys"), "devset")
+    max_errors = (
+        _bounded_int(request, "max_errors", len(devset) + 1, 0, MAX_OPTIMIZER_COUNT)
+        if "max_errors" in request
+        else len(devset) + 1
+    )
     metric = make_metric(request.get("metric"), session.tools)
     evaluator = dspy.Evaluate(
         devset=devset,
         metric=metric,
         num_threads=1,
         failure_score=float(request.get("failure_score", 0.0)),
-        max_errors=request.get("max_errors", len(devset) + 1),
+        max_errors=max_errors,
         provide_traceback=False,
         display_progress=False,
     )
@@ -1302,6 +1378,11 @@ def compile_program(
     session = Session(program, lm_call, tool_call)
     name = request.get("optimizer", "labeled-few-shot")
     config = dict(request.get("config") or {})
+    compile_config = request.get("compile_config") or {}
+    if not isinstance(compile_config, dict):
+        raise RequestError("'compile_config' must be an object")
+    _bound_counts(name, config, "config")
+    _bound_counts(name, compile_config, "compile_config")
     metric = make_metric(request.get("metric"), session.tools)
 
     with session.context():
@@ -1317,9 +1398,9 @@ def compile_program(
                 report["outputs"] = compiled(**request["inputs"]).toDict()
             return {**report, **_accounting(session.engine, False)}
 
-        trainset = session.examples(request.get("trainset"), request.get("input_keys"))
+        trainset = session.examples(request.get("trainset"), request.get("input_keys"), "trainset")
         valset = (
-            session.examples(request["valset"], request.get("input_keys"))
+            session.examples(request["valset"], request.get("input_keys"), "valset")
             if request.get("valset")
             else None
         )
@@ -1333,7 +1414,7 @@ def compile_program(
                 compile_kwargs["valset"] = valset
             if name == "mipro-v2" and len(valset or trainset) < 35:
                 compile_kwargs.setdefault("minibatch", False)
-            compile_kwargs.update(request.get("compile_config") or {})
+            compile_kwargs.update(compile_config)
             compiled = optimizer.compile(session.module, trainset=trainset, **compile_kwargs)
 
         report = {
@@ -1368,6 +1449,11 @@ def describe() -> dict[str, Any]:
         "pipeline_steps": ["program", "tool", "retrieve", "set", "repeat", "foreach", "when"],
         "pipeline_limits": {"max_repeat": MAX_REPEAT, "max_total_steps": MAX_TOTAL_STEPS},
         "module_limits": {"max_fanout": MAX_FANOUT, "max_iters": MAX_ITERS},
+        "request_limits": {
+            "max_batch_items": MAX_BATCH_ITEMS,
+            "max_dataset_items": MAX_DATASET_ITEMS,
+            "max_optimizer_count": MAX_OPTIMIZER_COUNT,
+        },
         "host_backed": {
             "retriever": "dspy.Retrieve / dspy.settings.rm via a host tool, or "
             "dspy.retrievers.Embeddings in-component over a corpus with a host embedder",

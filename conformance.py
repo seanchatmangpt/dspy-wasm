@@ -197,6 +197,90 @@ def vectors() -> list[dict[str, Any]]:
     out.append(
         _v("batches", "scalar batch item fails", "run", _run_args(inputs=[1]), state="FAILED")
     )
+    group = "batch_and_dataset_lengths_beyond_the_ceiling_are_refused"
+    over_batch = [{"question": "q"}] * (_int("max_batch_items") + 1)
+    out.append(
+        _v(
+            group,
+            "run batch over max_batch_items",
+            "run",
+            _run_args(inputs=over_batch),
+            state="FAILED",
+            message_contains="max_batch_items",
+        )
+    )
+    over_rows = [{"question": "q", "answer": "Paris"}] * (_int("max_dataset_items") + 1)
+    program = {"signature": "question -> answer"}
+    for name, export, request in (
+        ("evaluate devset", "evaluate", {"devset": over_rows}),
+        ("compile trainset", "compile", {"trainset": over_rows}),
+        ("compile valset", "compile", {"trainset": over_rows[:2], "valset": over_rows}),
+    ):
+        out.append(
+            _v(
+                group,
+                f"{name} over max_dataset_items",
+                export,
+                [json.dumps({"program": program, "metric": "exact_match", **request})],
+                state="FAILED",
+                message_contains="max_dataset_items",
+            )
+        )
+    group = "optimizer_counts_beyond_the_ceiling_are_refused"
+    count_cases = [
+        ("bootstrap-few-shot", "max_rounds", 10**9),
+        ("bootstrap-random-search", "num_candidate_programs", 10**6),
+        ("bootstrap-optuna", "num_candidate_programs", 10**6),
+        ("copro", "breadth", _int("max_optimizer_count") + 1),
+        ("simba", "max_steps", 10**9),
+        ("gepa", "max_metric_calls", 10**9),
+        ("labeled-few-shot", "k", True),
+        ("labeled-few-shot", "k", 2.0),
+        ("labeled-few-shot", "k", None),
+        ("labeled-few-shot", "k", -1),
+        ("labeled-few-shot", "k", "2"),
+    ]
+    for optimizer, key, bad in count_cases:
+        out.append(
+            _v(
+                group,
+                f"{optimizer} config {key}={bad!r}",
+                "compile",
+                [
+                    json.dumps(
+                        {
+                            "program": program,
+                            "optimizer": optimizer,
+                            "metric": "exact_match",
+                            "trainset": [{"question": "q", "answer": "Paris"}],
+                            "config": {key: bad},
+                        }
+                    )
+                ],
+                state="FAILED",
+                message_contains="integer in [",
+            )
+        )
+    out.append(
+        _v(
+            group,
+            "mipro-v2 compile_config num_trials=1e9",
+            "compile",
+            [
+                json.dumps(
+                    {
+                        "program": program,
+                        "optimizer": "mipro-v2",
+                        "metric": "exact_match",
+                        "trainset": [{"question": "q", "answer": "Paris"}],
+                        "compile_config": {"num_trials": 10**9},
+                    }
+                )
+            ],
+            state="FAILED",
+            message_contains="integer in [",
+        )
+    )
     dims, texts, values = (
         _int("max_embed_dimensions"),
         _int("max_embed_texts"),

@@ -334,6 +334,13 @@ def _case_boundary_refusals() -> None:
     assert f"[1, {caps.MAX_FANOUT}]" in message
     message = refusal({"module": "react", "max_iters": 10**9, "inputs": {"question": "q"}})
     assert f"[1, {caps.MAX_ITERS}]" in message
+    message = refusal(
+        {
+            "signature": "question -> answer",
+            "inputs": [{"question": "q"}] * (caps.MAX_BATCH_ITEMS + 1),
+        }
+    )
+    assert "max_batch_items" in message
 
     # A failed batch item is never ALIVE, and NaN never crosses as JSON.
     _reset()

@@ -38,6 +38,18 @@ LIMITS: dict[str, Limit] = {
         "component",
         "`max_iters`/`max_llm_calls` of react, program-of-thought, code-act, rlm",
     ),
+    "max_batch_items": Limit(
+        1_000, "component", "items in one `run` batch `inputs` array (each is at least one LM call)"
+    ),
+    "max_dataset_items": Limit(
+        1_000, "component", "rows in one `evaluate` `devset` or `compile` `trainset`/`valset`"
+    ),
+    "max_optimizer_count": Limit(
+        1_000,
+        "component",
+        "integer count knobs of optimizer `config`/`compile_config` (`max_rounds`, "
+        "`num_candidate_programs`, `num_trials`, `breadth`, `k`, ...; allow-listed per optimizer)",
+    ),
     "max_interpreter_events": Limit(
         1_000_000,
         "component",

@@ -204,6 +204,9 @@ derived from it (`python limits.py --write`), and a test fails on drift.
 | `max_total_steps` | 100,000 | component | steps one pipeline call executes across every nesting level |
 | `max_fanout` | 100 | component | samples `n`/`m` (majority, best-of-n, refine, multi-chain) and retrieval `k` |
 | `max_iters` | 1,000 | component | `max_iters`/`max_llm_calls` of react, program-of-thought, code-act, rlm |
+| `max_batch_items` | 1,000 | component | items in one `run` batch `inputs` array (each is at least one LM call) |
+| `max_dataset_items` | 1,000 | component | rows in one `evaluate` `devset` or `compile` `trainset`/`valset` |
+| `max_optimizer_count` | 1,000 | component | integer count knobs of optimizer `config`/`compile_config` (`max_rounds`, `num_candidate_programs`, `num_trials`, `breadth`, `k`, ...; allow-listed per optimizer) |
 | `max_interpreter_events` | 1,000,000 | component | trace events (calls, lines, returns) one interpreted-code execution may run |
 | `max_int_bits` | 4,096 | host | bit length of a `calculator` integer result |
 | `max_embed_dimensions` | 4,096 | host | `dimensions` of one `embed` call |
@@ -282,11 +285,18 @@ calls (`--max-tool-calls`) and bytes returned to the guest
 (`BudgetExceeded`; the CLI prints `error: ...` and exits 3, as it does for
 `DeadlineExceeded`). Unlike the request bounds inside the component, these live
 in the host, so a guest that bypasses a bound, or a knob nobody bounded, still
-cannot spend past them. Counters reset at every guest call. Batch length,
-dataset sizes and optimizer `config` counts (`max_rounds`,
-`num_candidate_programs`, ...) have no request-level limit; the meters and the
-deadline bound them. Measured on the CI-built component: a
-1,000,000-candidate `bootstrap-random-search` is aborted after 26 LM calls in
+cannot spend past them. Counters reset at every guest call. The component
+also bounds request volume before any work runs: a `run` batch `inputs` array
+is limited to `max_batch_items`, an `evaluate` `devset` or `compile`
+`trainset`/`valset` to `max_dataset_items`, and the integer count knobs of
+optimizer `config` and `compile_config` (an allow-list per optimizer, e.g.
+`max_rounds`, `num_candidate_programs`, `num_trials`, `breadth`, `k`,
+`max_steps`, `max_metric_calls`, and `evaluate`'s `max_errors`) to
+`max_optimizer_count`; other optimizer keys pass through unbounded. Over the
+limit, or not an integer, is a `FAILED` refusal. The meters and the deadline
+still bound whatever those limits allow. Before these limits, a
+1,000,000-candidate `bootstrap-random-search` ran until killed; the meters
+aborted it after 26 LM calls in
 0.1 s by `--max-lm-calls 25`, where the deadline alone took the full 60 s.
 
 `host.Guest` wraps an instance with a recycle policy for embedders: a call
