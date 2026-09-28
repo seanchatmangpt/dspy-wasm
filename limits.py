@@ -107,7 +107,12 @@ def write() -> None:
     contract = ROOT / "consumer" / "contract.json"
     data = json.loads(contract.read_text())
     data["limits"] = contract_limits()
-    contract.write_text(json.dumps(data, indent=2) + "\n")
+    text = json.dumps(data, indent=2) + "\n"
+    contract.write_text(text)
+    # The Elixir host is consumed as a sparse git dependency (consumer/elixir only),
+    # so it carries its own copy of the contract under priv/.
+    (ROOT / "consumer" / "elixir" / "priv").mkdir(exist_ok=True)
+    (ROOT / "consumer" / "elixir" / "priv" / "contract.json").write_text(text)
 
 
 if __name__ == "__main__":

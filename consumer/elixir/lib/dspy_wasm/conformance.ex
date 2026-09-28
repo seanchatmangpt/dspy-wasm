@@ -5,7 +5,7 @@ defmodule DspyWasm.Conformance do
   `message_contains`, `equals`, `includes`.
   """
 
-  @vectors Path.expand("../../../conformance.json", __DIR__)
+  @vectors Path.expand("../../priv/conformance.json", __DIR__)
   @external_resource @vectors
 
   def vectors, do: @vectors |> File.read!() |> Jason.decode!()

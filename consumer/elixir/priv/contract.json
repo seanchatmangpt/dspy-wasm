@@ -1,0 +1,48 @@
+{
+  "component": "dspy-wasm",
+  "component_version": "0.1.0",
+  "target": "wasm32-wasip2",
+  "wit_package": "chatman:dspy@0.1.0",
+  "world": "dspy",
+  "artifact": "dspy.wasm",
+  "payload_encoding": "json-string",
+  "success_state": "ALIVE",
+  "imports": {
+    "chatman:dspy/lm@0.1.0": [
+      "complete"
+    ],
+    "chatman:dspy/tools@0.1.0": [
+      "call"
+    ]
+  },
+  "exports": [
+    "component-version",
+    "runtime-info",
+    "dspy-version",
+    "run-self-tests",
+    "predict",
+    "capabilities",
+    "run",
+    "render",
+    "evaluate",
+    "compile"
+  ],
+  "limits": {
+    "max_repeat": 10000,
+    "max_total_steps": 100000,
+    "max_fanout": 100,
+    "max_iters": 1000,
+    "max_batch_items": 1000,
+    "max_dataset_items": 1000,
+    "max_optimizer_count": 1000,
+    "max_interpreter_events": 1000000,
+    "max_int_bits": 4096,
+    "max_embed_dimensions": 4096,
+    "max_embed_texts": 10000,
+    "max_embed_values": 1048576,
+    "deadline_s": 600.0,
+    "max_lm_calls": 20000,
+    "max_tool_calls": 100000,
+    "max_reply_bytes": 268435456
+  }
+}

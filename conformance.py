@@ -347,7 +347,11 @@ def check_vector(vector: dict[str, Any], report: dict[str, Any]) -> None:
 
 
 def write() -> None:
-    (ROOT / "consumer" / "conformance.json").write_text(json.dumps(vectors(), indent=2) + "\n")
+    text = json.dumps(vectors(), indent=2) + "\n"
+    (ROOT / "consumer" / "conformance.json").write_text(text)
+    # Copy for the Elixir host, which is consumed as a sparse dependency (see limits.write).
+    (ROOT / "consumer" / "elixir" / "priv").mkdir(exist_ok=True)
+    (ROOT / "consumer" / "elixir" / "priv" / "conformance.json").write_text(text)
 
 
 # ------------------------------------------------------------------- the runner

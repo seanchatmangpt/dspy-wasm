@@ -5,7 +5,7 @@ defmodule DspyWasm.Limits do
   refuses to compile against a contract that lacks a limit.
   """
 
-  @contract Path.expand("../../../contract.json", __DIR__)
+  @contract Path.expand("../../priv/contract.json", __DIR__)
   @external_resource @contract
   @limits @contract |> File.read!() |> Jason.decode!() |> Map.fetch!("limits")
 
