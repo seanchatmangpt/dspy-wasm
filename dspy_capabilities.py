@@ -848,9 +848,7 @@ def admit_program_state(module: dspy.Module, state: Any) -> dict[str, Any]:
     expected = program_subject(module)
     subject = state.get(SUBJECT_KEY)
     if subject is None:
-        raise RequestError(
-            f"unbound program_state: no {SUBJECT_KEY!r}; produce it with compile"
-        )
+        raise RequestError(f"unbound program_state: no {SUBJECT_KEY!r}; produce it with compile")
     if subject != expected:
         raise RequestError(f"stale program_state: compiled for {subject}, program is {expected}")
     for name, predictor in module.named_predictors():

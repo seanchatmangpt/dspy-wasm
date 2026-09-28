@@ -2,7 +2,6 @@ import json
 import re
 from pathlib import Path
 
-
 CONTRACT = json.loads(Path("consumer/contract.json").read_text())
 WIT = Path("wit/dspy.wit").read_text()
 APP = Path("app.py").read_text()
@@ -11,8 +10,8 @@ APP = Path("app.py").read_text()
 def test_contract_identity_matches_wit_and_component() -> None:
     assert CONTRACT["component"] == "dspy-wasm"
     assert CONTRACT["target"] == "wasm32-wasip2"
-    assert f'package {CONTRACT["wit_package"]};' in WIT
-    assert f'world {CONTRACT["world"]} {{' in WIT
+    assert f"package {CONTRACT['wit_package']};" in WIT
+    assert f"world {CONTRACT['world']} {{" in WIT
 
     version_match = re.search(
         r"def component_version\(self\) -> str:\s+return \"([^\"]+)\"",

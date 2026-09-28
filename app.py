@@ -305,7 +305,6 @@ def _case_compile_round_trip() -> None:
     assert report["outputs"]["answer"] == "Rome"
 
 
-
 def _case_boundary_refusals() -> None:
     """The request-boundary guards hold inside the component too."""
 

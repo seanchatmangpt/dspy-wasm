@@ -146,9 +146,7 @@ def test_empty_body_iterations_are_counted_statically() -> None:
     }
     report = json.loads(
         caps.guarded(
-            lambda: caps.run(
-                request, scripted("unused"), lambda n, a: tools.call(None, n, a)
-            )
+            lambda: caps.run(request, scripted("unused"), lambda n, a: tools.call(None, n, a))
         )
     )
     refused(report, f"MAX_TOTAL_STEPS={caps.MAX_TOTAL_STEPS}")
@@ -157,12 +155,16 @@ def test_empty_body_iterations_are_counted_statically() -> None:
 
 def test_foreach_with_an_empty_body_is_charged_per_item() -> None:
     steps = [{"foreach": "$items", "steps": []}]
-    ok = guarded(caps.run, {"module": "pipeline", "steps": steps, "inputs": {"items": [1, 2]}},
-                 scripted("unused"))
+    ok = guarded(
+        caps.run,
+        {"module": "pipeline", "steps": steps, "inputs": {"items": [1, 2]}},
+        scripted("unused"),
+    )
     assert ok["state"] == "ALIVE", ok
     items = list(range(caps.MAX_TOTAL_STEPS))
     report = guarded(
-        caps.run, {"module": "pipeline", "steps": steps, "inputs": {"items": items}},
+        caps.run,
+        {"module": "pipeline", "steps": steps, "inputs": {"items": items}},
         scripted("unused"),
     )
     refused(report, f"MAX_TOTAL_STEPS={caps.MAX_TOTAL_STEPS}")

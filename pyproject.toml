@@ -20,7 +20,7 @@ dspy = [
 ]
 dev = [
     "pytest>=8.0",
-    "ruff>=0.12",
+    "ruff==0.16.9",
 ]
 
 [tool.pytest.ini_options]
@@ -34,6 +34,11 @@ target-version = "py310"
 # Imports after pytest.importorskip are deliberate and marked `noqa: E402`;
 # keep E402 selected so those marks stay checked whatever ruff's default set is.
 extend-select = ["E402"]
+
+[tool.ruff.format]
+# wasi/** keys CI's WASI wheel cache; reformatting it would force a full
+# from-source rebuild of every native wheel for a whitespace change.
+exclude = ["wasi/**"]
 
 [tool.setuptools]
 py-modules = []
