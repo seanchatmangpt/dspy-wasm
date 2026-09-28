@@ -32,6 +32,7 @@
     "max_total_steps": 100000,
     "max_fanout": 100,
     "max_iters": 1000,
+    "max_interpreter_events": 1000000,
     "max_int_bits": 4096,
     "max_embed_dimensions": 4096,
     "max_embed_texts": 10000,

@@ -79,6 +79,7 @@ jobs:
           sha256sum dist/dspy.wasm > dist/dspy.wasm.sha256
           cp wit/dspy.wit dist/dspy.wit
           cp consumer/contract.json dist/contract.json
+          cp consumer/conformance.json dist/conformance.json
       - uses: actions/upload-artifact@v4
         with:
           name: dspy-wasm-${{ github.sha }}
@@ -87,6 +88,7 @@ jobs:
             dist/dspy.wasm.sha256
             dist/dspy.wit
             dist/contract.json
+            dist/conformance.json
           if-no-files-found: error
           retention-days: 30
       - run: python host.py dist/dspy.wasm --self-test
@@ -120,3 +122,29 @@ jobs:
         run: |
           python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
             --responses @examples/compile_responses.json
+
+  # The Elixir reference host (consumer/elixir) against the component this run
+  # built: the conformance vectors, budget abort and recovery, and the
+  # ash_dspy signature translation, through Wasmex.
+  elixir-host:
+    needs: dspy-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dspy-wasm-${{ github.sha }}
+          path: dist
+      - name: Build and test
+        working-directory: consumer/elixir
+        env:
+          DSPY_WASM_PATH: ${{ github.workspace }}/dist/dspy.wasm
+        run: |
+          mix deps.get
+          mix format --check-formatted
+          mix compile --warnings-as-errors
+          mix test

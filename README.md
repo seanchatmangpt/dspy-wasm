@@ -204,6 +204,7 @@ derived from it (`python limits.py --write`), and a test fails on drift.
 | `max_total_steps` | 100,000 | component | steps one pipeline call executes across every nesting level |
 | `max_fanout` | 100 | component | samples `n`/`m` (majority, best-of-n, refine, multi-chain) and retrieval `k` |
 | `max_iters` | 1,000 | component | `max_iters`/`max_llm_calls` of react, program-of-thought, code-act, rlm |
+| `max_interpreter_events` | 1,000,000 | component | trace events (calls, lines, returns) one interpreted-code execution may run |
 | `max_int_bits` | 4,096 | host | bit length of a `calculator` integer result |
 | `max_embed_dimensions` | 4,096 | host | `dimensions` of one `embed` call |
 | `max_embed_texts` | 10,000 | host | texts in one `embed` call |
@@ -237,6 +238,12 @@ equivalents:
 | asyncio self-pipe socket             | event loop without the cross-thread wake-up channel               |
 | imports at call time                 | lazily imported modules (dspy `require()`, litellm's lazy providers, numpy submodules) are imported at build time |
 | `inspect.stack()` per module call (dspy's "forward called directly" warning) | the same warning from a one-frame caller check; the full stack walk read source for every frame, so its cost grew with call depth |
+
+Interpreted code (program-of-thought, code-act, rlm) runs under a trace-event
+budget, `max_interpreter_events` per execution: a pure-Python loop, recursion or
+swallowed exception is stopped inside the component, for hosts with no deadline
+of their own. One long C call (`10**10**8`, `sum(range(10**12))`) is a single
+event and is not stopped; only a host deadline bounds that.
 
 Not supported, with reasons reported by `capabilities`: weight-training
 optimizers (`bootstrap-finetune`, `better-together`, `grpo`) need a provider's
@@ -300,6 +307,14 @@ python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
 
 `--responses` scripts the LM for deterministic runs; omit it and pass
 `--base-url`/`--upstream-model` to use a real OpenAI-compatible provider.
+
+## Elixir host
+
+`consumer/elixir` is a Wasmex host with the same budgets and recycling as
+`host.py`, the conformance vectors, and an `ash_dspy` signature translation;
+CI runs it against the component it just built. Wasmex 0.15 has no epoch
+deadline and cannot stop a running guest, so read `consumer/elixir/README.md`
+before deploying from Elixir.
 
 ## Conformance suite
 

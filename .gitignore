@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# The Elixir reference host has a lib/ that is source, not a Python build dir
+!consumer/elixir/lib/

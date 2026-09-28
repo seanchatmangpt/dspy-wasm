@@ -38,6 +38,11 @@ LIMITS: dict[str, Limit] = {
         "component",
         "`max_iters`/`max_llm_calls` of react, program-of-thought, code-act, rlm",
     ),
+    "max_interpreter_events": Limit(
+        1_000_000,
+        "component",
+        "trace events (calls, lines, returns) one interpreted-code execution may run",
+    ),
     "max_int_bits": Limit(4_096, "host", "bit length of a `calculator` integer result"),
     "max_embed_dimensions": Limit(4_096, "host", "`dimensions` of one `embed` call"),
     "max_embed_texts": Limit(10_000, "host", "texts in one `embed` call"),
