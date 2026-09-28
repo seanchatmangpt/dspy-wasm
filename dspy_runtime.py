@@ -101,6 +101,31 @@ class SequentialUnbatchify:
 _INSTALLED = False
 
 
+def _install_cheap_forward_check() -> None:
+    """Keep dspy's "forward called directly" warning without inspect.stack().
+
+    ``dspy.Module.__getattribute__`` calls ``inspect.stack()`` on every
+    ``forward`` lookup, i.e. once per module call. That resolves the source
+    file and reads source context for every frame on the stack, so each call
+    cost grew with call depth (nested pipeline steps, optimizers: 2-3x at 200
+    frames). The warning only needs the caller's function name, one frame up.
+    """
+    from dspy.primitives import module as dspy_module
+
+    module_cls = dspy_module.Module
+
+    def __getattribute__(self: Any, name: str) -> Any:
+        attr = super(module_cls, self).__getattribute__(name)
+        if name == "forward" and callable(attr) and sys._getframe(1).f_code.co_name != "__call__":
+            dspy_module.logger.warning(
+                f"Calling module.forward(...) on {type(self).__name__} directly is discouraged. "
+                "Please use module(...) instead."
+            )
+        return attr
+
+    module_cls.__getattribute__ = __getattribute__
+
+
 def install_sequential_runtime() -> None:
     """Pin all DSPy parallelism to its sequential path. Idempotent."""
     global _INSTALLED
@@ -123,6 +148,7 @@ def install_sequential_runtime() -> None:
     import dspy.utils.unbatchify as unbatchify  # noqa: PLR0402
 
     unbatchify.Unbatchify = embeddings.Unbatchify = SequentialUnbatchify
+    _install_cheap_forward_check()
     for module_name in (
         "dspy.predict.rlm",
         "dspy.teleprompt.avatar_optimizer",

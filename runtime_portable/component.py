@@ -1,6 +1,8 @@
 """Portable execution fabric: component."""
+
 from dataclasses import dataclass, field
 from typing import Any
+
 
 @dataclass(frozen=True)
 class Record:

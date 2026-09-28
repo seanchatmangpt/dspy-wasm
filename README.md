@@ -185,6 +185,21 @@ checked before anything runs, and data-dependent `foreach` lengths are charged
 against the same budget while executing; both refuse with `WorkBudgetError`.
 `capabilities` publishes both limits under `pipeline_limits`.
 
+Module fan-out is bounded the same way, before any LM call: samples `n`/`m`
+(`majority`, `best-of-n`, `refine`, `multi-chain-comparison`) and retrieval
+`k` are integers up to `MAX_FANOUT` (100), and `max_iters`/`max_llm_calls`
+(`react`, `react-v2`, `program-of-thought`, `code-act`, `rlm`) up to
+`MAX_ITERS` (1000). `capabilities` publishes both under `module_limits`.
+
+### Result envelopes
+
+Every export returns strict JSON: a non-finite number (`NaN`, `Infinity`) in
+an output fails the call rather than crossing as non-standard JSON. A batch
+`run` (`"inputs": [...]`) is `ALIVE` only when every item succeeds; otherwise
+it is `FAILED` with `error_type: "BatchItemError"`, the successful items'
+`outputs` in place (`null` for failed ones) and one
+`{"index", "error_type", "message"}` entry per failed item under `errors`.
+
 ### Runtime policy
 
 The component has no threads, subprocesses, filesystem or network. Rather than
@@ -198,6 +213,7 @@ equivalents:
 | Deno/Pyodide interpreter (PoT, CodeAct, RLM) | in-component `CodeInterpreter`: the component *is* the sandbox; host tools reachable via `__host_tool__` |
 | asyncio self-pipe socket             | event loop without the cross-thread wake-up channel               |
 | imports at call time                 | lazily imported modules (dspy `require()`, litellm's lazy providers, numpy submodules) are imported at build time |
+| `inspect.stack()` per module call (dspy's "forward called directly" warning) | the same warning from a one-frame caller check; the full stack walk read source for every frame, so its cost grew with call depth |
 
 Not supported, with reasons reported by `capabilities`: weight-training
 optimizers (`bootstrap-finetune`, `better-together`, `grpo`) need a provider's
@@ -211,7 +227,14 @@ supplies deterministic builtin tools: `calculator` (arithmetic only),
 `echo`, `grade_exact` (metric/reward), `search` and `embed` (over `--corpus`
 or a small default corpus). `--tool NAME=module:function` grants any host
 Python function as a tool. Host callbacks never raise into the component:
-failures cross as `{"error": ...}` envelopes.
+failures cross as `{"error": ...}` envelopes. A provider reply without choices
+or without text content (a refusal or tool-only reply) is such an error, and
+`null` token counts from a provider are reported as 0.
+
+Command-line mistakes are usage errors (exit 2, no traceback): an unreadable
+`@file` or invalid JSON, a `--tool` whose module, attribute or callable is
+missing, `--corpus`/`--responses` that are not arrays of strings, and a
+`--deadline` that is not a positive finite number.
 
 Every guest call (instantiation and each export call) runs under a Wasmtime
 epoch deadline, `--deadline SECONDS` (default 600), re-armed per call. A guest
@@ -252,11 +275,15 @@ BootstrapRS, COPRO, MIPROv2, SIMBA, GEPA, InferRules and BootstrapOptuna
 optimizers, and the compiled dependencies themselves: every native extension
 loaded from its `.so`, numpy linear algebra and FFT, optuna's TPE sampler,
 OpenSSL TLS contexts and hashing, and litellm with its Rust bridge, plus the
-request-boundary refusals (nested-repeat budget, `program_state` admission)
-executed inside the component (36 cases).
+request-boundary refusals (nested-repeat budget, `program_state` admission,
+module fan-out, batch failures, non-finite outputs) executed inside the
+component (36 cases).
 
 A successful report has `"state": "ALIVE"` and every case `ALIVE`. The same
-capability code is exercised natively by `make test`.
+capability code is exercised natively by `make test`, and
+`tests/test_component_court_native.py` runs `app.py` itself (all 36 cases and
+every export) natively with its WIT imports bound to the real host providers,
+so a broken case fails in seconds rather than after the WASI build.
 
 ## Host-backed Predict
 
@@ -318,7 +345,15 @@ Python -> WASM failure.
 - Host tools: `calculator` refuses results above 4096 bits (powers are
   refused before they are computed), non-real and non-finite values; every
   tool envelope is strict JSON (no `Infinity`/`NaN`); `search` needs
-  `k >= 0`; `embed` needs an array of strings.
+  `k >= 0`; `embed` needs an array of at most 10000 strings and
+  `dimensions` in `[1, 4096]`; float overflow is a refusal, not a crash.
+
+`tests/test_production_boundary.py` pins the refusals found against 8321947:
+optimizer `compile()` options (`sample`, `max_demos`) never reach the
+constructor, batch failures and non-finite outputs are never `ALIVE`,
+`input_keys` must be an array of strings, a loop step without `steps` is an
+empty loop, the module fan-out bounds, the embed bounds, the provider path
+over a real local HTTP server, and every CLI usage error.
 
 ```bash
 make bench   # writes bench/receipt.json; medians bounded by BOUNDS_MS

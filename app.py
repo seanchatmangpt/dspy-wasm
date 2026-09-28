@@ -305,7 +305,6 @@ def _case_compile_round_trip() -> None:
     assert report["outputs"]["answer"] == "Rome"
 
 
-
 def _case_boundary_refusals() -> None:
     """The request-boundary guards hold inside the component too."""
 
@@ -331,6 +330,22 @@ def _case_boundary_refusals() -> None:
     unbound = {"signature": {"fields": [{}, {}]}}
     message = refusal({"program_state": unbound, "inputs": {"question": "q"}})
     assert "unbound program_state" in message
+    message = refusal({"module": "majority", "n": 10**9, "inputs": {"question": "q"}})
+    assert f"[1, {caps.MAX_FANOUT}]" in message
+    message = refusal({"module": "react", "max_iters": 10**9, "inputs": {"question": "q"}})
+    assert f"[1, {caps.MAX_ITERS}]" in message
+
+    # A failed batch item is never ALIVE, and NaN never crosses as JSON.
+    _reset()
+    failing = lambda _request: json.dumps({"error": "provider down"})
+    batch = {"inputs": [{"question": "a"}, {"question": "b"}]}
+    report = json.loads(caps.guarded(lambda: caps.run(batch, failing, host_tools.call)))
+    assert report["state"] == "FAILED" and len(report["errors"]) == 2, report
+    _reset()
+    nan = {"signature": "question -> answer: float", "inputs": {"question": "q"}}
+    lm = _scripted(_chat(answer="nan"))
+    text = caps.guarded(lambda: caps.run(nan, lm, host_tools.call))
+    assert "NaN" not in text and json.loads(text)["state"] == "FAILED", text
 
 
 CALCULATOR = {
