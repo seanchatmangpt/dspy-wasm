@@ -45,6 +45,7 @@ from dspy.utils.dummies import DummyLM
 from dspy_bindings.imports import host_lm, host_tools
 
 import dspy_capabilities as caps
+import dspy_wasm_version
 from dspy_doubles import chat as _chat
 from dspy_doubles import schema_echo
 from dspy_doubles import scripted as _scripted
@@ -664,7 +665,7 @@ def _self_test_report() -> dict[str, Any]:
 
 class DspyBindings(wit.DspyBindings):
     def component_version(self) -> str:
-        return "0.1.0"
+        return dspy_wasm_version.VERSION
 
     def runtime_info(self) -> str:
         return json.dumps(

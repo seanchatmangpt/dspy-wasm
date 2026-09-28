@@ -4,7 +4,7 @@ defmodule DspyWasm.MixProject do
   def project do
     [
       app: :dspy_wasm,
-      version: "0.1.0",
+      version: "26.9.28",
       elixir: "~> 1.14",
       deps: [{:wasmex, "~> 0.15"}, {:jason, "~> 1.4"}],
       description: "Reference Elixir host for the dspy-wasm component (Wasmex)"

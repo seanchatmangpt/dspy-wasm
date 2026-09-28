@@ -20,6 +20,7 @@ import pytest
 from wasmtime import Instance, Module, Trap
 from wasmtime.component import Component, Linker
 
+import dspy_wasm_version
 import host
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,7 +114,7 @@ def test_cli_deadline_flag() -> None:
         check=False,
     )
     assert ok.returncode == 0, ok.stderr
-    assert "component-version: 0.1.0" in ok.stdout
+    assert f"component-version: {dspy_wasm_version.VERSION}" in ok.stdout
     refused = subprocess.run(
         [sys.executable, "host.py", str(BOOTSTRAP), "--deadline", "0"],
         cwd=ROOT,

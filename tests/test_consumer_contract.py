@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+import dspy_wasm_version
+
 CONTRACT = json.loads(Path("consumer/contract.json").read_text())
 WIT = Path("wit/dspy.wit").read_text()
 APP = Path("app.py").read_text()
@@ -13,12 +15,8 @@ def test_contract_identity_matches_wit_and_component() -> None:
     assert f"package {CONTRACT['wit_package']};" in WIT
     assert f"world {CONTRACT['world']} {{" in WIT
 
-    version_match = re.search(
-        r"def component_version\(self\) -> str:\s+return \"([^\"]+)\"",
-        APP,
-    )
-    assert version_match
-    assert version_match.group(1) == CONTRACT["component_version"]
+    assert "return dspy_wasm_version.VERSION" in APP
+    assert CONTRACT["component_version"] == dspy_wasm_version.VERSION
 
 
 def test_contract_imports_match_wit() -> None:

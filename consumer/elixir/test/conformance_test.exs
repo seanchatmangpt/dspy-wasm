@@ -30,8 +30,8 @@ defmodule DspyWasm.ConformanceTest do
     assert {:error, :starting} = DspyWasm.Host.call_json(host, "component-version")
   end
 
-  test "component-version is a bare string, not JSON", %{host: host} do
-    assert {:ok, "0.1.0"} = DspyWasm.Host.call_json(host, "component-version")
+  test "component-version is the contract's release version, a bare string not JSON", %{host: host} do
+    assert {:ok, DspyWasm.Limits.version()} == DspyWasm.Host.call_json(host, "component-version")
   end
 
   test "a translated ash_dspy signature runs end to end", %{host: host} do

@@ -21,6 +21,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
+      - run: python release.py check
       # Build first so the bootstrap deadline tests run instead of skipping.
       - run: make bootstrap
       - run: make test
@@ -76,10 +77,12 @@ jobs:
       - run: make dspy
       - name: Pack consumer artifact
         run: |
-          sha256sum dist/dspy.wasm > dist/dspy.wasm.sha256
           cp wit/dspy.wit dist/dspy.wit
           cp consumer/contract.json dist/contract.json
           cp consumer/conformance.json dist/conformance.json
+          python release.py manifest dist
+          python release.py verify dist
+          (cd dist && sha256sum -c dspy.wasm.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: dspy-wasm-${{ github.sha }}
@@ -89,6 +92,7 @@ jobs:
             dist/dspy.wit
             dist/contract.json
             dist/conformance.json
+            dist/release.json
           if-no-files-found: error
           retention-days: 30
       - run: python host.py dist/dspy.wasm --self-test

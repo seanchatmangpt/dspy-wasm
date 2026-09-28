@@ -6,10 +6,12 @@ import sys
 
 import dspy_bindings as wit
 
+import dspy_wasm_version
+
 
 class DspyBindings(wit.DspyBindings):
     def component_version(self) -> str:
-        return "0.1.0"
+        return dspy_wasm_version.VERSION
 
     def runtime_info(self) -> str:
         return json.dumps(

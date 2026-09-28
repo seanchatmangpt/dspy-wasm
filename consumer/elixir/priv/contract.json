@@ -1,6 +1,6 @@
 {
   "component": "dspy-wasm",
-  "component_version": "0.1.0",
+  "component_version": "26.9.28",
   "target": "wasm32-wasip2",
   "wit_package": "chatman:dspy@0.1.0",
   "world": "dspy",

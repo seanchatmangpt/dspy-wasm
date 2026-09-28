@@ -7,7 +7,12 @@ defmodule DspyWasm.Limits do
 
   @contract Path.expand("../../priv/contract.json", __DIR__)
   @external_resource @contract
-  @limits @contract |> File.read!() |> Jason.decode!() |> Map.fetch!("limits")
+  @decoded @contract |> File.read!() |> Jason.decode!()
+  @limits Map.fetch!(@decoded, "limits")
+  @version Map.fetch!(@decoded, "component_version")
+
+  @doc "The component release version the contract describes (CalVer, `YY.M.D`)."
+  def version, do: @version
 
   def all, do: @limits
   def fetch!(name), do: Map.fetch!(@limits, name)

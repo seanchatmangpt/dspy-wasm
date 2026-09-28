@@ -326,6 +326,16 @@ CI runs it against the component it just built. Wasmex 0.15 has no epoch
 deadline and cannot stop a running guest, so read `consumer/elixir/README.md`
 before deploying from Elixir.
 
+## Releases
+
+Versions are CalVer (`YY.M.D`, `dspy_wasm_version.py`); the requirements a
+release must meet and the check behind each are in `RELEASE.md`, and
+`CHANGELOG.md` lists what each release changed and what it does not prove.
+`python release.py check` verifies the version identity, `release.py manifest`
+and `verify` produce and check `release.json` and a relative-path
+`dspy.wasm.sha256`, and `.github/workflows/release.yml` builds from a clean
+cache and publishes on a `v*` tag.
+
 ## Conformance suite
 
 `conformance.py` checks that a host and a component honour the contract, for
