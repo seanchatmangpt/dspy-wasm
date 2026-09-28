@@ -472,11 +472,13 @@ def test_direct_forward_still_warns_and_call_does_not(caplog) -> None:
         assert "directly is discouraged" not in caplog.text
 
 
-def test_module_call_cost_does_not_scale_with_stack_depth() -> None:
-    # Before: dspy's forward check ran inspect.stack(), reading source for
-    # every frame on each module call: 2-3x slower from a 200-frame stack
-    # (nested pipeline steps, optimizers), and worse the more modules loaded.
-    import time
+def test_module_call_work_does_not_scale_with_stack_depth() -> None:
+    # Before: dspy's forward check ran inspect.stack(), resolving and reading
+    # source for every frame on each module call: 2-3x slower from a
+    # 200-frame stack (nested pipeline steps, optimizers). Counted, not
+    # timed: the number of `inspect` calls one module call makes must not
+    # depend on how deep the caller's stack is.
+    import inspect
 
     request = {"signature": "question -> answer", "inputs": {"question": "q"}}
 
@@ -486,14 +488,21 @@ def test_module_call_cost_does_not_scale_with_stack_depth() -> None:
     def deep(n: int) -> None:
         return once() if n == 0 else deep(n - 1)
 
-    def median_ms(fn) -> float:
-        fn()  # warm
-        samples = []
-        for _ in range(15):
-            start = time.perf_counter()
-            fn()
-            samples.append(time.perf_counter() - start)
-        return sorted(samples)[7] * 1000
+    def inspect_calls(fn) -> int:
+        count = 0
 
-    shallow, deep_ms = median_ms(once), median_ms(lambda: deep(300))
-    assert deep_ms < 1.6 * shallow, (shallow, deep_ms)
+        def profiler(frame, event, _arg) -> None:
+            nonlocal count
+            if event == "call" and frame.f_code.co_filename == inspect.__file__:
+                count += 1
+
+        fn()  # warm caches so both measurements see the same state
+        sys.setprofile(profiler)
+        try:
+            fn()
+        finally:
+            sys.setprofile(None)
+        return count
+
+    shallow, deep_calls = inspect_calls(once), inspect_calls(lambda: deep(300))
+    assert deep_calls == shallow, (shallow, deep_calls)
