@@ -44,12 +44,20 @@ from collections.abc import Callable
 from typing import Any
 
 import dspy
+import numpy
 import pydantic
 from dspy.dsp.utils import dotdict
 from dspy.evaluate.metrics import EM, F1, normalize_text
 from dspy.lm15 import Config, Message, Response, Usage
 
 import dspy_runtime
+
+# Load numpy completely now (app.py does the same for the component). If dspy
+# was imported first, sys.modules["numpy"] is dspy.utils.lazy_import's proxy,
+# and a first numpy import through a submodule (optuna -> numpy.polynomial)
+# re-enters that proxy mid-initialisation: "data type 'bool' not understood".
+# Any attribute access executes numpy once, whichever was imported first.
+numpy.ndarray  # noqa: B018 - the access is the point
 
 LmCall = Callable[[str], str]
 ToolCall = Callable[[str, str], str]
@@ -111,6 +119,12 @@ MAX_REPEAT = 10_000
 # before execution (product of nested multipliers) and enforced dynamically
 # while executing (data-dependent `foreach` lengths).
 MAX_TOTAL_STEPS = 100_000
+# Upper bounds on one module's fan-out (samples n/m, retrieval k) and on its
+# iteration counts (max_iters, max_llm_calls). Each is an LM or tool call
+# multiplier that repeat/foreach budgets do not see; without a ceiling only
+# the host's wall-clock deadline stops `majority` with n=1e9.
+MAX_FANOUT = 100
+MAX_ITERS = 1_000
 # Names the host-tool shim reserves inside generated tool source.
 _RESERVED_TOOL_NAMES = frozenset({"SUBMIT", "__host_tool__"})
 
@@ -160,6 +174,21 @@ def _repeat_times(step: dict[str, Any]) -> int:
     if isinstance(times, bool) or not isinstance(times, int) or not (0 <= times <= MAX_REPEAT):
         raise RequestError(f"'repeat' must be an integer in [0, {MAX_REPEAT}]")
     return times
+
+
+def _bounded_int(spec: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    value = spec.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not (low <= value <= high):
+        raise RequestError(f"{key!r} must be an integer in [{low}, {high}]")
+    return value
+
+
+def _fanout(spec: dict[str, Any], key: str, default: int, low: int = 1) -> int:
+    return _bounded_int(spec, key, default, low, MAX_FANOUT)
+
+
+def _iters(spec: dict[str, Any], key: str, default: int) -> int:
+    return _bounded_int(spec, key, default, 1, MAX_ITERS)
 
 
 def _body_work(steps: Any) -> int:
@@ -224,7 +253,9 @@ def json_default(value: Any) -> Any:
 
 
 def dumps(value: Any) -> str:
-    return json.dumps(value, default=json_default, sort_keys=True)
+    # allow_nan=False: NaN/Infinity are not JSON; a non-finite output fails
+    # the call instead of crossing the boundary as non-standard JSON.
+    return json.dumps(value, default=json_default, sort_keys=True, allow_nan=False)
 
 
 # --------------------------------------------------------------------------- LM
@@ -302,7 +333,10 @@ class HostEngine:
             model=raw.get("model") or request.model,
             message=Message.assistant(raw["text"]),
             finish_reason=raw.get("finish_reason", "stop"),
-            usage=Usage(**{k: int(v) for k, v in usage.items() if k in _USAGE_FIELDS}),
+            # null means "not reported"; any other non-integer fails closed.
+            usage=Usage(
+                **{k: int(v) for k, v in usage.items() if k in _USAGE_FIELDS and v is not None}
+            ),
         )
 
 
@@ -697,9 +731,9 @@ class Pipeline(dspy.Module):
                 setattr(self, attribute, factory(program))
                 self._programs[attribute] = program
                 self._inputs_for[attribute] = program_inputs(program)
-            for key in ("steps",):
-                if key in step:
-                    self._register(step[key], factory)
+            # A loop without a body is an empty loop, as pipeline_work counts it.
+            if step.get("steps") is not None:
+                self._register(step["steps"], factory)
 
     @staticmethod
     def _lookup(state: dict[str, Any], path: str) -> Any:
@@ -773,7 +807,7 @@ class Pipeline(dspy.Module):
                 for _ in range(_repeat_times(step)):
                     if empty:  # the loop itself is the work (see _body_work)
                         budget.charge()
-                    self._execute(step["steps"], state)
+                    self._execute(step.get("steps") or [], state)
                     if "until" in step and self._resolve(step["until"], state):
                         break
             elif "foreach" in step:
@@ -784,7 +818,7 @@ class Pipeline(dspy.Module):
                     if empty:  # the loop itself is the work (see _body_work)
                         budget.charge()
                     inner = {**state, step.get("as", "item"): item}
-                    self._execute(step["steps"], inner)
+                    self._execute(step.get("steps") or [], inner)
                     for key, inner_key in collect.items():
                         gathered[key].append(inner[inner_key])
                 state.update(gathered)
@@ -909,29 +943,29 @@ class Builder:
 
     def _react(self, spec):
         return dspy.ReAct(
-            self._signature(spec), tools=self._tools(spec), max_iters=int(spec.get("max_iters", 10))
+            self._signature(spec), tools=self._tools(spec), max_iters=_iters(spec, "max_iters", 10)
         )
 
     def _react_v2(self, spec):
         return dspy.ReActV2(
-            self._signature(spec), tools=self._tools(spec), max_iters=int(spec.get("max_iters", 10))
+            self._signature(spec), tools=self._tools(spec), max_iters=_iters(spec, "max_iters", 10)
         )
 
     def _program_of_thought(self, spec):
-        return dspy.ProgramOfThought(self._signature(spec), max_iters=int(spec.get("max_iters", 3)))
+        return dspy.ProgramOfThought(self._signature(spec), max_iters=_iters(spec, "max_iters", 3))
 
     def _code_act(self, spec):
         return dspy.CodeAct(
             self._signature(spec),
             tools=[self.tools.function(t) for t in spec.get("tools", [])],
-            max_iters=int(spec.get("max_iters", 5)),
+            max_iters=_iters(spec, "max_iters", 5),
         )
 
     def _rlm(self, spec):
         return dspy.RLM(
             self._signature(spec),
-            max_iters=int(spec.get("max_iters", 20)),
-            max_llm_calls=int(spec.get("max_llm_calls", 50)),
+            max_iters=_iters(spec, "max_iters", 20),
+            max_llm_calls=_iters(spec, "max_llm_calls", 50),
             tools=[self.tools.function(t) for t in spec.get("tools", [])] or None,
         )
 
@@ -942,7 +976,7 @@ class Builder:
             raise RequestError("best-of-n/refine 'base' must be a single-step module")
         return wrapper(
             module=self(base_spec),
-            N=int(spec.get("n", 3)),
+            N=_fanout(spec, "n", 3),
             reward_fn=_reward(spec, self.tools),
             threshold=float(spec.get("threshold", 1.0)),
             fail_count=spec.get("fail_count"),
@@ -955,16 +989,16 @@ class Builder:
         return self._wrapped(spec, dspy.Refine)
 
     def _multi_chain_comparison(self, spec):
-        return MultiChainProgram(self._signature(spec), m=int(spec.get("m", 3)))
+        return MultiChainProgram(self._signature(spec), m=_fanout(spec, "m", 3))
 
     def _majority(self, spec):
         base = spec.get("base", "predict")
         base_spec = base if isinstance(base, dict) else {"module": base, **_signature_keys(spec)}
-        return MajorityProgram(self(base_spec), n=int(spec.get("n", 5)), field=spec.get("field"))
+        return MajorityProgram(self(base_spec), n=_fanout(spec, "n", 5), field=spec.get("field"))
 
     def _retrieve(self, spec):
         return RetrieveProgram(
-            k=int(spec.get("k", 3)), query_field=spec.get("query_field", "query")
+            k=_fanout(spec, "k", 3, low=0), query_field=spec.get("query_field", "query")
         )
 
     def _pipeline(self, spec):
@@ -1035,7 +1069,7 @@ class Session:
 
         def rm(query: str, k: int | None = None, **_: Any) -> list:
             passages = index(query).passages
-            return [dotdict(long_text=p) for p in passages[: k or len(passages)]]
+            return [dotdict(long_text=p) for p in (passages if k is None else passages[:k])]
 
         return rm
 
@@ -1066,11 +1100,33 @@ class Session:
     def examples(self, rows: Any, input_keys: list[str] | None) -> list[dspy.Example]:
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise RequestError("datasets must be JSON arrays of objects")
+        if input_keys is not None and (
+            not isinstance(input_keys, list) or not all(isinstance(k, str) for k in input_keys)
+        ):
+            raise RequestError("'input_keys' must be an array of strings")
         input_keys = input_keys or program_inputs(self.spec) or []
         return [dspy.Example(**row).with_inputs(*input_keys) for row in rows]
 
 
 # ------------------------------------------------------------------ capabilities
+
+
+def _batch_errors(results: list, exceptions: list[Exception]) -> list[dict[str, Any]]:
+    """Pair each failed batch slot (a ``None`` result) with its exception.
+
+    ``Parallel`` collects exceptions in completion order; the sequential
+    runtime completes in submission order, so the n-th failure is the n-th
+    ``None`` slot.
+    """
+    failed = [index for index, result in enumerate(results) if result is None]
+    return [
+        {
+            "index": index,
+            "error_type": type(exc).__name__ if exc is not None else "Unknown",
+            "message": str(exc) if exc is not None else "item produced no prediction",
+        }
+        for index, exc in zip(failed, list(exceptions) + [None] * len(failed))
+    ]
 
 
 def run(request: dict[str, Any], lm_call: LmCall, tool_call: ToolCall) -> dict[str, Any]:
@@ -1083,10 +1139,22 @@ def run(request: dict[str, Any], lm_call: LmCall, tool_call: ToolCall) -> dict[s
             examples = [
                 dspy.Example(**coerce_inputs(signature, item)).with_inputs(*item) for item in inputs
             ]
-            outputs: Any = [
-                p.toDict() if p is not None else None
-                for p in session.module.batch(examples, num_threads=1)
-            ]
+            results, _, exceptions = session.module.batch(
+                examples, num_threads=1, max_errors=len(examples) + 1, return_failed_examples=True
+            )
+            outputs: Any = [p.toDict() if p is not None else None for p in results]
+            errors = _batch_errors(results, exceptions)
+            if errors:
+                # A failed item is never reported as ALIVE: the outputs that
+                # did succeed ride along, and every failure is named by index.
+                return {
+                    "state": "FAILED",
+                    "error_type": "BatchItemError",
+                    "message": f"{len(errors)} of {len(examples)} batch items failed",
+                    "outputs": outputs,
+                    "errors": errors,
+                    **_accounting(session.engine, request.get("trace", False)),
+                }
         elif isinstance(inputs, dict):
             kwargs = coerce_inputs(signature, inputs)
             if request.get("async"):
@@ -1166,7 +1234,8 @@ def evaluate(request: dict[str, Any], lm_call: LmCall, tool_call: ToolCall) -> d
 def _optimizer(name: str, config: dict[str, Any], metric, session: Session):
     lm = session.lm
     if name == "labeled-few-shot":
-        return dspy.LabeledFewShot(**{"k": 16, **config}), {"sample": config.pop("sample", True)}
+        sample = config.pop("sample", True)  # a compile() option, not a constructor one
+        return dspy.LabeledFewShot(**{"k": 16, **config}), {"sample": sample}
     if name == "bootstrap-few-shot":
         return dspy.BootstrapFewShot(metric=metric, **config), {}
     if name == "bootstrap-random-search":
@@ -1182,9 +1251,10 @@ def _optimizer(name: str, config: dict[str, Any], metric, session: Session):
             **config,
         ), {}
     if name == "bootstrap-optuna":
+        max_demos = config.pop("max_demos", 2)  # a compile() option, not a constructor one
         return dspy.BootstrapFewShotWithOptuna(
             metric=metric, num_threads=1, **{"num_candidate_programs": 2, **config}
-        ), {"max_demos": config.pop("max_demos", 2)}
+        ), {"max_demos": max_demos}
     if name == "copro":
         return dspy.COPRO(metric=metric, prompt_model=lm, **{"breadth": 2, "depth": 1, **config}), {
             "eval_kwargs": {"num_threads": 1, "display_progress": False}
@@ -1296,6 +1366,7 @@ def describe() -> dict[str, Any]:
         "optimizers": list(OPTIMIZERS),
         "pipeline_steps": ["program", "tool", "retrieve", "set", "repeat", "foreach", "when"],
         "pipeline_limits": {"max_repeat": MAX_REPEAT, "max_total_steps": MAX_TOTAL_STEPS},
+        "module_limits": {"max_fanout": MAX_FANOUT, "max_iters": MAX_ITERS},
         "host_backed": {
             "retriever": "dspy.Retrieve / dspy.settings.rm via a host tool, or "
             "dspy.retrievers.Embeddings in-component over a corpus with a host embedder",
