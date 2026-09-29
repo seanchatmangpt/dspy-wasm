@@ -21,15 +21,18 @@ import json
 import math
 import operator
 import os
+import sys
 import threading
 import urllib.request
 import weakref
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from wasmtime import Config, Engine, Store, Trap, WasiConfig, WasmtimeError
 from wasmtime.component import Component, Linker
+
+import limits
 
 DEFAULT_RESPONSE = "[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]"
 
@@ -90,7 +93,14 @@ class CompletionProvider:
         self.api_key = api_key
         self.upstream_model = upstream_model
 
-    def complete(self, _store, request_json: str) -> str:
+    def complete(self, store, request_json: str) -> str:
+        meter = _meter(store)
+        if meter is not None:
+            meter.charge_lm()  # over budget raises: the guest call is aborted, not answered
+        reply = self._complete(request_json)
+        return meter.charge_reply(reply) if meter is not None else reply
+
+    def _complete(self, request_json: str) -> str:
         try:
             request = json.loads(request_json)
             if self.scripted_responses:
@@ -187,7 +197,7 @@ _ARITHMETIC: dict[type, Callable[..., Any]] = {
 # Largest integer magnitude (in bits) the calculator will produce. Without it
 # nested powers such as ((10**64)**64)**64 grow the host's memory and time
 # doubly exponentially while every single exponent stays within bounds.
-MAX_INT_BITS = 4096
+MAX_INT_BITS = int(limits.value("max_int_bits"))
 
 
 def _bounded(value: Any) -> Any:
@@ -245,9 +255,12 @@ def grade_exact(example: dict, prediction: dict, field: str = "answer") -> dict[
     return {"score": float(expected == actual)}
 
 
-# Ceilings on one `embed` call: its output is len(texts) * dimensions floats.
-MAX_EMBED_DIMENSIONS = 4096
-MAX_EMBED_TEXTS = 10_000
+# Ceilings on one `embed` call: its output is len(texts) * dimensions floats,
+# so the product is bounded too (both axis ceilings together were 41M floats,
+# a 205 MB reply).
+MAX_EMBED_DIMENSIONS = int(limits.value("max_embed_dimensions"))
+MAX_EMBED_TEXTS = int(limits.value("max_embed_texts"))
+MAX_EMBED_VALUES = int(limits.value("max_embed_values"))
 
 DEFAULT_CORPUS = (
     "Hamlet was written by William Shakespeare.",
@@ -299,6 +312,10 @@ class Corpus:
             raise ValueError(f"dimensions must be an integer in [1, {MAX_EMBED_DIMENSIONS}]")
         if len(texts) > MAX_EMBED_TEXTS:
             raise ValueError(f"at most {MAX_EMBED_TEXTS} texts per call")
+        if len(texts) * dimensions > MAX_EMBED_VALUES:
+            raise ValueError(
+                f"texts x dimensions must not exceed {MAX_EMBED_VALUES} values per call"
+            )
         vectors = []
         for text in texts:
             vector = [0.0] * dimensions
@@ -329,7 +346,14 @@ class ToolProvider:
         self.tools = builtin_tools(corpus)
         self.tools.update(tools or {})
 
-    def call(self, _store, name: str, args_json: str) -> str:
+    def call(self, store, name: str, args_json: str) -> str:
+        meter = _meter(store)
+        if meter is not None:
+            meter.charge_tool()
+        reply = self._call(name, args_json)
+        return meter.charge_reply(reply) if meter is not None else reply
+
+    def _call(self, name: str, args_json: str) -> str:
         try:
             tool = self.tools.get(name)
             if tool is None:
@@ -368,13 +392,68 @@ def load_tool(spec: str) -> tuple[str, Callable[..., Any]]:
 # Enforced by Wasmtime epoch interruption, independently of any request-level
 # check inside the component: a guest that loops (a bypassed pipeline budget,
 # a pathological regex, interpreted code) traps instead of pinning the host.
-DEFAULT_DEADLINE_S = 600.0
+DEFAULT_DEADLINE_S = float(limits.value("deadline_s"))
 # Epoch tick period: deadlines are enforced with this granularity.
 EPOCH_TICK_S = 0.01
 
 
 class DeadlineExceeded(RuntimeError):
     """A guest call ran past its epoch deadline and was interrupted."""
+
+
+class BudgetExceeded(RuntimeError):
+    """A guest call spent more LM calls, tool calls or reply bytes than its budget."""
+
+
+class Budget(NamedTuple):
+    """What one guest call may spend crossing the WIT boundary. ``None`` is unlimited."""
+
+    max_lm_calls: int | None = int(limits.value("max_lm_calls"))
+    max_tool_calls: int | None = int(limits.value("max_tool_calls"))
+    max_reply_bytes: int | None = int(limits.value("max_reply_bytes"))
+
+
+class Meter:
+    """Counts one guest call's boundary crossings and aborts it past its budget.
+
+    The guest is the thing being contained, so its own request bounds are a
+    courtesy; this counter lives in the host, where a guest that bypasses them
+    (or a bound nobody thought of) cannot skip it. Exceeding a budget raises
+    from the host callback, which traps the guest; ``guest_call`` then reports
+    BudgetExceeded. Counters reset at the start of every guest call.
+    """
+
+    def __init__(self, budget: Budget) -> None:
+        self.budget = budget
+        self.lm_calls = self.tool_calls = self.reply_bytes = 0
+        self.tripped: BudgetExceeded | None = None
+
+    def reset(self) -> None:
+        self.lm_calls = self.tool_calls = self.reply_bytes = 0
+        self.tripped = None
+
+    def _trip(self, message: str) -> None:
+        self.tripped = BudgetExceeded(message)
+        raise self.tripped
+
+    def charge_lm(self) -> None:
+        self.lm_calls += 1
+        cap = self.budget.max_lm_calls
+        if cap is not None and self.lm_calls > cap:
+            self._trip(f"guest call exceeded its budget of {cap} LM calls")
+
+    def charge_tool(self) -> None:
+        self.tool_calls += 1
+        cap = self.budget.max_tool_calls
+        if cap is not None and self.tool_calls > cap:
+            self._trip(f"guest call exceeded its budget of {cap} tool calls")
+
+    def charge_reply(self, reply: str) -> str:
+        self.reply_bytes += len(reply.encode())
+        cap = self.budget.max_reply_bytes
+        if cap is not None and self.reply_bytes > cap:
+            self._trip(f"guest call exceeded its budget of {cap} reply bytes")
+        return reply
 
 
 class _EpochTicker:
@@ -424,10 +503,13 @@ def new_engine() -> Engine:
     return engine
 
 
-def new_store(engine: Engine, deadline_s: float = DEFAULT_DEADLINE_S) -> Store:
-    """Store whose every guest call is bounded by ``deadline_s`` seconds."""
+def new_store(
+    engine: Engine, deadline_s: float = DEFAULT_DEADLINE_S, budget: Budget | None = None
+) -> Store:
+    """Store whose every guest call is bounded by ``deadline_s`` seconds and ``budget``."""
     store = Store(engine)
     store.dspy_wasm_deadline_s = deadline_s
+    store.dspy_wasm_meter = Meter(budget or Budget())
     arm_deadline(store)
     return store
 
@@ -445,14 +527,23 @@ def guest_call(store: Store, func: Callable[..., Any], *args: Any) -> Any:
     or error propagates unchanged.
     """
     arm_deadline(store)
+    meter = _meter(store)
+    if meter is not None:
+        meter.reset()
     try:
         return func(store, *args)
     except (Trap, WasmtimeError) as error:
+        if meter is not None and meter.tripped is not None:
+            raise meter.tripped from error
         if _is_interrupt(error):
             raise DeadlineExceeded(
                 f"guest call exceeded its {store.dspy_wasm_deadline_s:g} s deadline"
             ) from error
         raise
+
+
+def _meter(store: Any) -> Meter | None:
+    return getattr(store, "dspy_wasm_meter", None) if store is not None else None
 
 
 # Wasmtime's rendering of TrapCode::Interrupt in a component call error.
@@ -471,9 +562,10 @@ def instantiate(
     provider: CompletionProvider,
     tools: ToolProvider | None = None,
     deadline_s: float = DEFAULT_DEADLINE_S,
+    budget: Budget | None = None,
 ):
     engine = new_engine()
-    store = new_store(engine, deadline_s)
+    store = new_store(engine, deadline_s, budget)
     # WASI grants clocks and entropy only: no preopened directories, no
     # environment, no argv, no network grants. Provider authority stays here.
     wasi = WasiConfig()
@@ -486,9 +578,11 @@ def instantiate(
 
     with linker.root() as root:
         with root.add_instance("chatman:dspy/lm@0.1.0") as lm:
-            lm.add_func("complete", provider.complete)
+            # The callback receives Wasmtime's own context, not our Store: bind ours
+            # so the provider can reach the meter.
+            lm.add_func("complete", lambda _ctx, request: provider.complete(store, request))
         with root.add_instance("chatman:dspy/tools@0.1.0") as tool_instance:
-            tool_instance.add_func("call", tools.call)
+            tool_instance.add_func("call", lambda _ctx, name, args: tools.call(store, name, args))
 
     instance = guest_call(store, linker.instantiate, component)
     return store, instance
@@ -502,6 +596,87 @@ def call_json(store, instance, export_name: str, *args: str) -> dict[str, Any]:
     if not isinstance(result, str):
         raise TypeError(f"{export_name} returned non-string result")
     return json.loads(result)
+
+
+class Guest:
+    """A component instance with a recycle policy.
+
+    A trapped instance cannot be re-entered (a deadline or budget abort leaves
+    ``wasm trap: cannot enter component instance``), and a long-lived one only
+    grows. ``Guest`` replaces the instance when a call traps, and after
+    ``max_calls`` calls if set. With ``prewarm`` the replacement is instantiated
+    on a background thread while the caller carries on, hiding the multi-second
+    instantiation from the next request.
+
+    Not thread-safe: one caller at a time, like the instance it wraps.
+    """
+
+    def __init__(
+        self,
+        component_path: Path,
+        provider: CompletionProvider,
+        tools: ToolProvider | None = None,
+        *,
+        deadline_s: float = DEFAULT_DEADLINE_S,
+        budget: Budget | None = None,
+        max_calls: int | None = None,
+        prewarm: bool = False,
+    ) -> None:
+        if max_calls is not None and (
+            isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1
+        ):
+            raise ValueError("max_calls must be a positive integer or None")
+        self._make = lambda: instantiate(component_path, provider, tools, deadline_s, budget)
+        self.max_calls = max_calls
+        self.prewarm = prewarm
+        self.instances_created = 0
+        self._current: tuple[Any, Any] | None = None
+        self._calls = 0
+        self._warm: threading.Thread | None = None
+        self._warm_result: list[Any] = []
+
+    def _spawn(self) -> None:
+        def build() -> None:
+            try:
+                self._warm_result.append(self._make())
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+                self._warm_result.append(exc)
+
+        self._warm_result.clear()
+        self._warm = threading.Thread(target=build, name="dspy-wasm-prewarm", daemon=True)
+        self._warm.start()
+
+    def _instance(self) -> tuple[Any, Any]:
+        if self._current is None:
+            if self._warm is not None:
+                self._warm.join()
+                self._warm = None
+                result = self._warm_result.pop()
+                if isinstance(result, BaseException):
+                    raise result
+                self._current = result
+            else:
+                self._current = self._make()
+            self.instances_created += 1
+            self._calls = 0
+        return self._current
+
+    def _retire(self) -> None:
+        self._current = None
+        if self.prewarm and self._warm is None:
+            self._spawn()
+
+    def call_json(self, export_name: str, *args: str) -> dict[str, Any]:
+        store, instance = self._instance()
+        try:
+            return call_json(store, instance, export_name, *args)
+        except (DeadlineExceeded, BudgetExceeded, Trap, WasmtimeError):
+            self._retire()  # the instance is dead; the next call gets a fresh one
+            raise
+        finally:
+            self._calls += 1
+            if self.max_calls is not None and self._calls >= self.max_calls and self._current:
+                self._retire()
 
 
 def _request(value: str) -> str:
@@ -537,10 +712,29 @@ def _deadline(value: str) -> float:
     return seconds
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
 REQUEST_EXPORTS = ("run", "render", "evaluate", "compile")
 
 
 def main() -> None:
+    try:
+        _main()
+    except (DeadlineExceeded, BudgetExceeded) as exc:
+        # A guest that ran away is an operational outcome, not a host bug: no traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(3) from None
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("component", type=Path)
     parser.add_argument("--self-test", action="store_true")
@@ -582,6 +776,23 @@ def main() -> None:
         metavar="SECONDS",
         help="wall-clock ceiling on each guest call (Wasmtime epoch interruption)",
     )
+    for flag, field, what in (
+        ("--max-lm-calls", "max_lm_calls", "LM calls"),
+        ("--max-tool-calls", "max_tool_calls", "tool calls"),
+        ("--max-reply-bytes", "max_reply_bytes", "bytes returned to the guest"),
+    ):
+        parser.add_argument(
+            flag,
+            type=_positive_int,
+            default=getattr(Budget(), field),
+            metavar="N",
+            help=f"budget of {what} per guest call; exceeding it aborts the call",
+        )
+    parser.add_argument(
+        "--conformance",
+        action="store_true",
+        help="run the conformance suite against the component (needs --response PREDICT_ANSWER)",
+    )
     parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--upstream-model", default=os.environ.get("DSPY_WASM_MODEL"))
@@ -591,6 +802,10 @@ def main() -> None:
     # Deterministic static response is the default only for tests/inspection.
     # Explicit real-provider configuration disables it.
     static_response = args.response
+    if args.conformance:
+        import conformance
+
+        static_response, scripted = conformance.PREDICT_ANSWER, None
     if static_response is None and not args.base_url and not scripted:
         static_response = DEFAULT_RESPONSE
 
@@ -602,9 +817,16 @@ def main() -> None:
         scripted_responses=scripted,
     )
     corpus = Corpus(args.corpus) if args.corpus else None
-    store, instance = instantiate(
-        args.component, provider, ToolProvider(dict(args.tool), corpus), args.deadline
-    )
+    budget = Budget(args.max_lm_calls, args.max_tool_calls, args.max_reply_bytes)
+    tools = ToolProvider(dict(args.tool), corpus)
+
+    if args.conformance:
+        guest = Guest(args.component, provider, tools, deadline_s=args.deadline, budget=budget)
+        report = conformance.run(guest.call_json, include_self_test=args.self_test)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        raise SystemExit(0 if report["state"] == "ALIVE" else 1)
+
+    store, instance = instantiate(args.component, provider, tools, args.deadline, budget)
 
     def emit(report: dict[str, Any]) -> None:
         print(json.dumps(report, indent=2, sort_keys=True))

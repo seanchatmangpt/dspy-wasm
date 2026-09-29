@@ -1,0 +1,103 @@
+name: release
+
+# Builds the component from a CLEAN cache (no actions/cache: the WASI toolchain
+# and every native wheel are compiled from source with the current stable
+# Rust), runs the release gates, and on a version tag publishes a GitHub
+# release. Started by hand it is a dry run: it uploads the artifact and
+# publishes nothing. Requirements: RELEASE.md (R1-R8).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Rust toolchain for wasm32-wasip2
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add wasm32-wasip2
+      - name: Rust must be >= 1.95 (R8)
+        run: |
+          rustc --version
+          cargo --version
+          python - <<'PY'
+          import re, subprocess
+          out = subprocess.run(["rustc", "--version"], capture_output=True, text=True, check=True).stdout
+          major, minor = map(int, re.search(r"rustc (\d+)\.(\d+)", out).groups())
+          assert (major, minor) >= (1, 95), out
+          PY
+      - run: python -m pip install -e ".[dev,dspy]"
+      - name: Version identity (R1, R7)
+        run: python release.py check
+      - name: The tag names this version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          expected="v$(python -c 'import dspy_wasm_version as v; print(v.VERSION)')"
+          test "$GITHUB_REF_NAME" = "$expected" || { echo "tag $GITHUB_REF_NAME != $expected"; exit 1; }
+      - run: ruff check . && ruff format --check .
+      - run: make bootstrap
+      - run: make test
+        env:
+          DSPY_WASM_FORBID_SKIPS: "1"
+      - run: make wasi-toolchain
+      - run: |
+          python wasi/build_wheels.py fetch
+          python wasi/build_wheels.py build --missing
+      - run: python wasi/build_wheels.py install
+      - run: make dspy
+      - name: Pack and verify the artifact (R4)
+        run: |
+          cp wit/dspy.wit dist/dspy.wit
+          cp consumer/contract.json dist/contract.json
+          cp consumer/conformance.json dist/conformance.json
+          python release.py manifest dist
+          python release.py verify dist
+          (cd dist && sha256sum -c dspy.wasm.sha256)
+      - name: In-component court (R5)
+        run: python host.py dist/dspy.wasm --self-test
+      - name: Conformance (R5, R6)
+        run: python host.py dist/dspy.wasm --conformance
+      - name: Host budget aborts a runaway compile (R5)
+        run: |
+          if python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
+              --responses @examples/compile_responses.json --max-lm-calls 1; then
+            echo "budget was not enforced"; exit 1
+          else
+            test $? -eq 3
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dspy-wasm-release-${{ github.sha }}
+          path: |
+            dist/dspy.wasm
+            dist/dspy.wasm.sha256
+            dist/dspy.wit
+            dist/contract.json
+            dist/conformance.json
+            dist/release.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/dspy.wasm dist/dspy.wasm.sha256 dist/dspy.wit dist/contract.json \
+            dist/conformance.json dist/release.json \
+            --title "dspy-wasm $GITHUB_REF_NAME" \
+            --notes "See CHANGELOG.md and RELEASE.md. Verify with: sha256sum -c dspy.wasm.sha256"

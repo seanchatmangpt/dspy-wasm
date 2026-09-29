@@ -266,6 +266,27 @@ def test_embed_at_its_ceiling_is_accepted() -> None:
     assert len(envelope["result"][0]) == host.MAX_EMBED_DIMENSIONS
 
 
+def test_embed_bounds_the_product_not_only_each_axis() -> None:
+    # Before: each axis was capped, the product was not. The two ceilings
+    # together made 41M floats: a 205 MB reply after 18 s.
+    args = {"texts": ["a"] * host.MAX_EMBED_TEXTS, "dimensions": host.MAX_EMBED_DIMENSIONS}
+    envelope = json.loads(host_tools("embed", json.dumps(args)))
+    assert "ValueError" in envelope["error"], str(envelope)[:200]
+
+
+def test_embed_at_its_value_ceiling_is_accepted() -> None:
+    dimensions = host.MAX_EMBED_DIMENSIONS
+    texts = ["a b c"] * (host.MAX_EMBED_VALUES // dimensions)
+    envelope = json.loads(
+        host_tools("embed", json.dumps({"texts": texts, "dimensions": dimensions}))
+    )
+    assert len(envelope["result"]) == len(texts)
+    over = json.loads(
+        host_tools("embed", json.dumps({"texts": texts + ["x"], "dimensions": dimensions}))
+    )
+    assert "ValueError" in over["error"], over
+
+
 @pytest.mark.parametrize(
     "expression", ["(2**63)**64 * 1.0", "(2**63)**64 / 3", "(2**63)**64 ** 1.0", "10.0**400"]
 )

@@ -39,6 +39,8 @@ from typing import TYPE_CHECKING, Any
 
 from dspy.primitives.code_interpreter import CodeExecutionError, CodeInterpreterError, FinalOutput
 
+import limits
+
 if TYPE_CHECKING:
     from typing_extensions import Self
 
@@ -164,6 +166,35 @@ def install_sequential_runtime() -> None:
 # -------------------------------------------------------------- interpreter
 
 
+MAX_INTERPRETER_EVENTS = int(limits.value("max_interpreter_events"))
+
+
+class _StepBudgetExceeded(BaseException):
+    """Interpreted code ran past its trace-event budget (BaseException: not catchable by `except Exception`)."""
+
+
+def _event_budget(limit: int) -> Callable[..., Any]:
+    """A ``sys.settrace`` hook that raises once ``limit`` events have run.
+
+    The count stays over the limit, so code that catches the exception and
+    loops on is stopped again at its next event. This bounds pure-Python loops
+    and recursion; a single long C call (``10**10**8``, ``sum(range(10**12))``)
+    is one event, and only the host's deadline stops that.
+    """
+    events = 0
+
+    def tracer(frame: Any, event: str, arg: Any) -> Any:
+        nonlocal events
+        events += 1
+        if events > limit:
+            raise _StepBudgetExceeded(
+                f"interpreted code exceeded its budget of {limit} trace events"
+            )
+        return tracer
+
+    return tracer
+
+
 class _Submission(BaseException):
     """Raised by SUBMIT. A ``BaseException`` so ``except Exception`` in
     interpreted code cannot swallow it; ``ComponentInterpreter`` also records
@@ -272,14 +303,21 @@ class ComponentInterpreter:
         last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
         stdout = io.StringIO()
         self._submitted = None
+        previous_trace = sys.gettrace()
         try:
-            with contextlib.redirect_stdout(stdout):
-                exec(compile(tree, "<interpreter>", "exec"), namespace)  # noqa: S102 - the interpreter
-                value = (
-                    eval(compile(ast.Expression(last.value), "<interpreter>", "eval"), namespace)
-                    if last
-                    else None
-                )
+            sys.settrace(_event_budget(MAX_INTERPRETER_EVENTS))
+            try:
+                with contextlib.redirect_stdout(stdout):
+                    exec(compile(tree, "<interpreter>", "exec"), namespace)  # noqa: S102 - the interpreter
+                    value = (
+                        eval(
+                            compile(ast.Expression(last.value), "<interpreter>", "eval"), namespace
+                        )
+                        if last
+                        else None
+                    )
+            finally:
+                sys.settrace(previous_trace)
         except _Submission as submission:
             return FinalOutput(_jsonable(submission.value))
         except SyntaxError:

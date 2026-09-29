@@ -3,6 +3,12 @@ name: component-courts
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      clean_cache:
+        description: Build the WASI toolchain and wheels from scratch (no cache restore)
+        type: boolean
+        default: false
 
 jobs:
   bootstrap:
@@ -15,6 +21,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
+      - run: python release.py check
       # Build first so the bootstrap deadline tests run instead of skipping.
       - run: make bootstrap
       - run: make test
@@ -35,10 +42,17 @@ jobs:
           rustup default stable
           rustup target add wasm32-wasip2
       - run: python -m pip install -e ".[dev,dspy]"
+      # Build first: without dist/bootstrap.wasm the two epoch-deadline tests
+      # skip, and this job (the only one with dspy) then runs 212 of 214.
+      - run: make bootstrap
       - run: make test
+        env:
+          DSPY_WASM_FORBID_SKIPS: "1"
+      - run: rustc --version && cargo --version
 
       # wasi-sdk, CPython 3.14 for WASI, zlib, libyaml, OpenSSL, componentize-py.
       - name: Cache WASI toolchain
+        if: ${{ !inputs.clean_cache }}
         uses: actions/cache@v4
         with:
           path: build/wasi
@@ -47,6 +61,7 @@ jobs:
 
       # Every native dependency cross-compiled from source.
       - name: Cache WASI wheels
+        if: ${{ !inputs.clean_cache }}
         uses: actions/cache@v4
         with:
           path: |
@@ -62,9 +77,12 @@ jobs:
       - run: make dspy
       - name: Pack consumer artifact
         run: |
-          sha256sum dist/dspy.wasm > dist/dspy.wasm.sha256
           cp wit/dspy.wit dist/dspy.wit
           cp consumer/contract.json dist/contract.json
+          cp consumer/conformance.json dist/conformance.json
+          python release.py manifest dist
+          python release.py verify dist
+          (cd dist && sha256sum -c dspy.wasm.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: dspy-wasm-${{ github.sha }}
@@ -73,9 +91,21 @@ jobs:
             dist/dspy.wasm.sha256
             dist/dspy.wit
             dist/contract.json
+            dist/conformance.json
+            dist/release.json
           if-no-files-found: error
           retention-days: 30
       - run: python host.py dist/dspy.wasm --self-test
+      - name: Conformance suite
+        run: python host.py dist/dspy.wasm --conformance
+      - name: Host budget aborts a runaway compile
+        run: |
+          if python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
+              --responses @examples/compile_responses.json --max-lm-calls 1; then
+            echo "budget was not enforced"; exit 1
+          else
+            test $? -eq 3
+          fi
       - name: Host-backed Predict
         run: |
           python host.py dist/dspy.wasm \
@@ -96,3 +126,29 @@ jobs:
         run: |
           python host.py dist/dspy.wasm --compile @examples/compile_bootstrap.json \
             --responses @examples/compile_responses.json
+
+  # The Elixir reference host (consumer/elixir) against the component this run
+  # built: the conformance vectors, budget abort and recovery, and the
+  # ash_dspy signature translation, through Wasmex.
+  elixir-host:
+    needs: dspy-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dspy-wasm-${{ github.sha }}
+          path: dist
+      - name: Build and test
+        working-directory: consumer/elixir
+        env:
+          DSPY_WASM_PATH: ${{ github.workspace }}/dist/dspy.wasm
+        run: |
+          mix deps.get
+          mix format --check-formatted
+          mix compile --warnings-as-errors
+          mix test
